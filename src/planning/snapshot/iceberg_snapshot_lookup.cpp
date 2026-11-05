@@ -1,5 +1,10 @@
 #include "iceberg_options.hpp"
 
+#include "duckdb/common/string_util.hpp"
+
+#include <cerrno>
+#include <cstdlib>
+
 namespace duckdb {
 
 IcebergSnapshotLookup IcebergSnapshotLookup::FromTimestamp(timestamp_ms_t snapshot_timestamp) {
@@ -37,6 +42,12 @@ IcebergSnapshotLookup IcebergSnapshotLookup::FromAtClause(optional_ptr<BoundAtCl
 	}
 }
 
+void IcebergSnapshotLookup::VerifyOptionNotNull(const string &option, const Value &value) {
+	if (value.IsNull()) {
+		throw InvalidInputException("'%s' can not be NULL", option);
+	}
+}
+
 IcebergSnapshotLookup IcebergSnapshotLookup::FromRef(const string &ref_name) {
 	if (ref_name.empty()) {
 		throw InvalidInputException("Iceberg ref name can not be empty");
@@ -51,12 +62,23 @@ IcebergSnapshotLookup IcebergSnapshotLookup::FromVersion(const Value &value) {
 	if (value.type().id() != LogicalTypeId::VARCHAR) {
 		return FromSnapshotId(value.DefaultCastAs(LogicalType::BIGINT).GetValue<int64_t>());
 	}
-	//! Like Spark, a string that parses as a snapshot id is a snapshot id; anything else names a ref
-	auto snapshot_id = value.DefaultTryCastAs(LogicalType::BIGINT, nullptr, true);
-	if (snapshot_id) {
-		return FromSnapshotId(snapshot_id->GetValue<int64_t>());
+	//! Like Spark (Long.parseLong): an optional sign and only digits, in int64 range, is a snapshot id;
+	//! any other string, including one that overflows, names a ref
+	auto &str = StringValue::Get(value);
+	idx_t pos = (!str.empty() && (str[0] == '+' || str[0] == '-')) ? 1 : 0;
+	bool all_digits = pos < str.size();
+	for (idx_t i = pos; i < str.size() && all_digits; i++) {
+		all_digits = StringUtil::CharacterIsDigit(str[i]);
 	}
-	return FromRef(StringValue::Get(value));
+	if (all_digits) {
+		errno = 0;
+		char *end = nullptr;
+		auto snapshot_id = std::strtoll(str.c_str(), &end, 10);
+		if (errno != ERANGE && end == str.c_str() + str.size()) {
+			return FromSnapshotId(snapshot_id);
+		}
+	}
+	return FromRef(str);
 }
 
 } // namespace duckdb

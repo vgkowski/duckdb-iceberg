@@ -4,8 +4,8 @@
   "location": "./lineitem_iceberg",
   "last-sequence-number": 2,
   "last-updated-ms": 1746188480005,
-  "last-column-id": 16,
-  "current-schema-id": 0,
+  "last-column-id": 17,
+  "current-schema-id": 1,
   "schemas": [
     {
       "type": "struct",
@@ -108,6 +108,114 @@
           "type": "string"
         }
       ]
+    },
+    {
+      "type": "struct",
+      "schema-id": 1,
+      "fields": [
+        {
+          "id": 1,
+          "name": "l_orderkey",
+          "required": false,
+          "type": "long"
+        },
+        {
+          "id": 2,
+          "name": "l_partkey",
+          "required": false,
+          "type": "long"
+        },
+        {
+          "id": 3,
+          "name": "l_suppkey",
+          "required": false,
+          "type": "long"
+        },
+        {
+          "id": 4,
+          "name": "l_linenumber",
+          "required": false,
+          "type": "long"
+        },
+        {
+          "id": 5,
+          "name": "l_quantity",
+          "required": false,
+          "type": "decimal(15, 2)"
+        },
+        {
+          "id": 6,
+          "name": "l_extendedprice",
+          "required": false,
+          "type": "decimal(15, 2)"
+        },
+        {
+          "id": 7,
+          "name": "l_discount",
+          "required": false,
+          "type": "decimal(15, 2)"
+        },
+        {
+          "id": 8,
+          "name": "l_tax",
+          "required": false,
+          "type": "decimal(15, 2)"
+        },
+        {
+          "id": 9,
+          "name": "l_returnflag",
+          "required": false,
+          "type": "string"
+        },
+        {
+          "id": 10,
+          "name": "l_linestatus",
+          "required": false,
+          "type": "string"
+        },
+        {
+          "id": 11,
+          "name": "l_shipdate",
+          "required": false,
+          "type": "date"
+        },
+        {
+          "id": 12,
+          "name": "l_commitdate",
+          "required": false,
+          "type": "date"
+        },
+        {
+          "id": 13,
+          "name": "l_receiptdate",
+          "required": false,
+          "type": "date"
+        },
+        {
+          "id": 14,
+          "name": "l_shipinstruct",
+          "required": false,
+          "type": "string"
+        },
+        {
+          "id": 15,
+          "name": "l_shipmode",
+          "required": false,
+          "type": "string"
+        },
+        {
+          "id": 16,
+          "name": "l_comment",
+          "required": false,
+          "type": "string"
+        },
+        {
+          "id": 17,
+          "name": "l_added",
+          "required": false,
+          "type": "int"
+        }
+      ]
     }
   ],
   "default-spec-id": 0,
@@ -147,6 +255,14 @@
     "42": {
       "snapshot-id": 7817332053627255703,
       "type": "tag"
+    },
+    "dangling": {
+      "snapshot-id": 1,
+      "type": "tag"
+    },
+    "weird": {
+      "snapshot-id": 7817332053627255703,
+      "type": "bogus"
     }
   },
   "snapshots": [

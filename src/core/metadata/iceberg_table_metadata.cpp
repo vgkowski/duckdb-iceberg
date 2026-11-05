@@ -161,7 +161,8 @@ optional_ptr<const IcebergSnapshot> IcebergTableMetadata::GetSnapshotByRef(const
 	string ref_type;
 	if (refs) {
 		auto entry = refs->additional_properties.find(ref_name);
-		if (entry != refs->additional_properties.end()) {
+		//! The parsed map ignores case, but Iceberg ref names are case-sensitive
+		if (entry != refs->additional_properties.end() && entry->first == ref_name) {
 			snapshot_id = entry->second.snapshot_id;
 			ref_type = StringUtil::Lower(entry->second.type);
 		}
@@ -172,6 +173,7 @@ optional_ptr<const IcebergSnapshot> IcebergTableMetadata::GetSnapshotByRef(const
 		ref_type = "branch";
 	}
 	if (!snapshot_id) {
+		static constexpr idx_t MAX_LISTED_REFS = 10;
 		vector<string> available;
 		if (refs) {
 			for (auto &entry : refs->additional_properties) {
@@ -179,15 +181,24 @@ optional_ptr<const IcebergSnapshot> IcebergTableMetadata::GetSnapshotByRef(const
 			}
 		}
 		std::sort(available.begin(), available.end());
-		throw InvalidInputException("Iceberg ref '%s' does not exist (available refs: %s)", ref_name,
-		                            available.empty() ? "none" : StringUtil::Join(available, ", "));
+		string listed = available.empty() ? "none" : "";
+		for (idx_t i = 0; i < available.size() && i < MAX_LISTED_REFS; i++) {
+			listed += (i ? ", " : "") + available[i];
+		}
+		if (available.size() > MAX_LISTED_REFS) {
+			listed += StringUtil::Format(" and %d more", available.size() - MAX_LISTED_REFS);
+		}
+		throw InvalidInputException("Iceberg ref '%s' does not exist (available refs: %s)", ref_name, listed);
 	}
-	is_branch = ref_type != "tag";
+	if (ref_type != "branch" && ref_type != "tag") {
+		throw InvalidConfigurationException("Iceberg ref '%s' has unknown type '%s', expected 'branch' or 'tag'",
+		                                    ref_name, ref_type);
+	}
+	is_branch = ref_type == "branch";
 	auto snapshot = FindSnapshotByIdInternal(*snapshot_id);
 	if (!snapshot) {
 		throw InvalidConfigurationException(
-		    "Iceberg ref '%s' points at snapshot %s, which is not in the table metadata", ref_name,
-		    std::to_string(*snapshot_id));
+		    "Iceberg ref '%s' points at snapshot %d, which is not in the table metadata", ref_name, *snapshot_id);
 	}
 	return snapshot;
 }
@@ -198,6 +209,7 @@ IcebergSnapshotScanInfo IcebergTableMetadata::GetSnapshot(const IcebergSnapshotL
 	case SnapshotSource::LATEST:
 		snapshot_info.snapshot = GetLatestSnapshot();
 		snapshot_info.schema_id = GetCurrentSchemaId();
+		snapshot_info.is_transaction_head = true;
 		return snapshot_info;
 	case SnapshotSource::FROM_ID:
 		snapshot_info.snapshot = GetSnapshotById(lookup.GetSnapshotId());
@@ -210,6 +222,8 @@ IcebergSnapshotScanInfo IcebergTableMetadata::GetSnapshot(const IcebergSnapshotL
 		//! Iceberg spec "Schema selection with branches and tags": a branch reads with the table's
 		//! current schema, a tag with the schema of its snapshot
 		snapshot_info.schema_id = is_branch ? GetCurrentSchemaId() : snapshot_info.snapshot->GetSchemaId();
+		//! Reading 'main' explicitly must match a plain read, including this transaction's own writes
+		snapshot_info.is_transaction_head = ref.name == "main";
 		return snapshot_info;
 	}
 	case SnapshotSource::FROM_TIMESTAMP:

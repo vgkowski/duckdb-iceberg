@@ -662,14 +662,14 @@ optional_ptr<CatalogEntry> IcebergTable::GetSchemaVersion(optional_ptr<BoundAtCl
 	auto snapshot_lookup = IcebergSnapshotLookup::FromAtClause(at);
 	auto snapshot_info = table_metadata.GetSnapshot(snapshot_lookup);
 
-	int32_t schema_id;
-	if (!snapshot_lookup.IsLatest() && snapshot_info.snapshot) {
-		//! Branch reads use the current schema; ids, timestamps and tags use the snapshot's schema
-		schema_id = snapshot_info.schema_id;
-	} else {
-		schema_id = table_metadata.GetCurrentSchemaId();
+	//! GetSnapshot picks the schema per source: current for latest and branches, the snapshot's for ids,
+	//! timestamps and tags
+	auto schema_id = snapshot_info.snapshot ? snapshot_info.schema_id : table_metadata.GetCurrentSchemaId();
+	auto entry = schema_versions.find(schema_id);
+	if (entry == schema_versions.end() || !entry->second) {
+		throw InvalidConfigurationException("Schema id %d not found in Iceberg metadata", schema_id);
 	}
-	return schema_versions[schema_id].get();
+	return entry->second.get();
 }
 
 idx_t IcebergTable::GetIcebergVersion() const {

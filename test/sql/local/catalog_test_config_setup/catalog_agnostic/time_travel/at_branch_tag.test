@@ -25,6 +25,45 @@ select count(*) from my_datalake.default.at_branch_tag AT (VERSION => 'main');
 ----
 3
 
+# Inside a transaction, an explicit read of 'main' sees the transaction's own writes, like a plain read
+statement ok
+begin;
+
+statement ok
+insert into my_datalake.default.at_branch_tag values (4);
+
+query II
+select
+	(select count(*) from my_datalake.default.at_branch_tag),
+	(select count(*) from my_datalake.default.at_branch_tag AT (VERSION => 'main'));
+----
+4	4
+
+statement ok
+rollback;
+
+# Strings that are not plain digits name a ref, as in Spark (Long.parseLong)
+statement error
+select count(*) from my_datalake.default.at_branch_tag AT (VERSION => ' 1 ');
+----
+Iceberg ref ' 1 ' does not exist
+
+statement error
+select count(*) from my_datalake.default.at_branch_tag AT (VERSION => '0x2A');
+----
+Iceberg ref '0x2A' does not exist
+
+statement error
+select count(*) from my_datalake.default.at_branch_tag AT (VERSION => '99999999999999999999');
+----
+Iceberg ref '99999999999999999999' does not exist
+
+# Digits with a sign or leading zeros are a snapshot id
+statement error
+select count(*) from my_datalake.default.at_branch_tag AT (VERSION => '007');
+----
+Could not find snapshot with id 7
+
 # A numeric string is still a snapshot id
 statement ok
 set variable first_snapshot = (

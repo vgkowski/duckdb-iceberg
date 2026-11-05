@@ -9,10 +9,13 @@ namespace duckdb {
 
 enum class SnapshotSource : uint8_t { LATEST, FROM_TIMESTAMP, FROM_ID, FROM_REF };
 
-static constexpr const char *SNAPSHOT_OPTIONS_EXCLUSIVE_ERROR =
-    "Only one of 'snapshot_from_id', 'snapshot_from_timestamp' and 'snapshot_from_ref' can be used";
-
 struct IcebergSnapshotLookup {
+public:
+	static constexpr const char *EXCLUSIVE_OPTIONS_ERROR =
+	    "Only one of 'snapshot_from_id', 'snapshot_from_timestamp' and 'snapshot_from_ref' can be used";
+	//! Throws if a snapshot option value is NULL
+	static void VerifyOptionNotNull(const string &option, const Value &value);
+
 public:
 	using SnapshotFromId = int64_t;
 	using SnapshotFromTimestamp = timestamp_ms_t;
@@ -35,7 +38,8 @@ public:
 	static IcebergSnapshotLookup FromTimestamp(timestamp_ms_t snapshot_timestamp);
 	//! Throws if 'ref_name' is empty
 	static IcebergSnapshotLookup FromRef(const string &ref_name);
-	//! A VERSION value: an integer is a snapshot id, any other string is a ref name (as in Spark and Trino)
+	//! A VERSION value: an integer, or a string of digits, is a snapshot id; any other string is a ref
+	//! name (as in Spark). A ref named like a number is only reachable through 'snapshot_from_ref'.
 	static IcebergSnapshotLookup FromVersion(const Value &value);
 	static IcebergSnapshotLookup FromAtClause(optional_ptr<BoundAtClause> at);
 

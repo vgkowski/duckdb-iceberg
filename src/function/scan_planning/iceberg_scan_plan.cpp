@@ -116,7 +116,7 @@ static unique_ptr<FunctionData> IcebergScanPlanBind(ClientContext &context, Tabl
 		auto &schema = metadata.GetSchemaFromId(snapshot.schema_id);
 		auto &fs = FileSystem::GetFileSystem(context);
 		scan_info = make_shared_ptr<IcebergScanInfo>(metadata.GetMetadataPath(fs), metadata, snapshot, schema);
-		if (options.snapshot_lookup->IsLatest() && table_entry->table_info.transaction_data) {
+		if (snapshot.is_transaction_head && table_entry->table_info.transaction_data) {
 			scan_info->transaction_data = table_entry->table_info.transaction_data.get();
 		}
 	} else {
