@@ -25,6 +25,7 @@
 #include "catalog/rest/catalog_entry/table/iceberg_table.hpp"
 #include "common/iceberg_default.hpp"
 #include "catalog/rest/transaction/iceberg_transaction.hpp"
+#include "catalog/rest/transaction/iceberg_transaction_data.hpp"
 
 namespace duckdb {
 class OAuth2Authorization;
@@ -78,7 +79,16 @@ TableFunction IcebergTableSchemaVersion::GetScanFunction(ClientContext &context,
 	auto snapshot_lookup = IcebergSnapshotLookup::FromAtClause(lookup.GetAtClause());
 
 	IcebergSnapshotScanInfo snapshot_info;
-	snapshot_info = metadata.GetSnapshot(snapshot_lookup);
+	if (snapshot_lookup.IsLatest()) {
+		//! Without an AT clause the session's WAP branch is read (main when unset), as Spark with spark.wap.branch
+		auto wap_branch = GetIcebergWapBranch(context);
+		if (table_info.transaction_data) {
+			table_info.transaction_data->VerifyTargetBranch(wap_branch);
+		}
+		snapshot_info = metadata.GetBranchReadSnapshot(wap_branch);
+	} else {
+		snapshot_info = metadata.GetSnapshot(snapshot_lookup);
+	}
 	//! Override whatever schema id the lookup resulted in
 	//! The schema is preset by the IcebergCatalogEntry and we can not deviate from that
 	snapshot_info.schema_id = schema_id;

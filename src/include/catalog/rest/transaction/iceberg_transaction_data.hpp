@@ -62,8 +62,17 @@ public:
 	void TableSetLocation();
 	//! Roll main back to an ancestor snapshot (Spark rollback_to_snapshot semantics).
 	void TableRollbackToSnapshot(int64_t snapshot_id);
+	//! The branch this transaction's snapshots commit to: fixed by the first data-changing statement from
+	//! iceberg_wap_branch, "main" before that
+	const string &GetTargetBranch() const;
+	//! Throws if this transaction's snapshots target another branch than the session's iceberg_wap_branch, so a scan
+	//! never mixes the transaction's pending changes with another branch's state
+	void VerifyTargetBranch(const string &session_branch) const;
 
 private:
+	//! Fix the target branch from iceberg_wap_branch on the first data-changing statement; later ones must agree.
+	//! Called with lock held.
+	void BindTargetBranch(lock_guard<mutex> &guard);
 	void CacheExistingManifestList(lock_guard<mutex> &guard, const IcebergTableMetadata &metadata);
 	//! Retains one pending delete manifest per partition spec present in 'delete_files'.
 	void AddPendingDeleteManifests(IcebergAddSnapshot &add_snapshot, partitioned_manifest_entry_map_t &&delete_files);
@@ -114,6 +123,9 @@ public:
 	bool rolls_back = false;
 	//! A rewrite cannot be combined with other changes to the table's rows.
 	bool rewrites_data_files = false;
+	//! Branch the snapshots commit to, see GetTargetBranch
+	string target_branch = "main";
+	bool target_branch_bound = false;
 	mutable mutex lock;
 };
 

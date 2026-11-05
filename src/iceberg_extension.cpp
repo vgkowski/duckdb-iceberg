@@ -45,6 +45,13 @@ static void SetDefaultFormatVersion(ClientContext &context, SetScope scope, Valu
 	}
 }
 
+static void SetWapBranch(ClientContext &context, SetScope scope, Value &parameter) {
+	if (parameter.IsNull()) {
+		return;
+	}
+	ValidateIcebergBranchName(StringValue::Get(parameter));
+}
+
 static void SetMetadataLogClockSkew(ClientContext &context, SetScope scope, Value &parameter) {
 	if (parameter.IsNull() || parameter.GetValue<int64_t>() < 0) {
 		throw InvalidConfigurationException("'%s' must be a non-negative number of milliseconds",
@@ -130,6 +137,12 @@ static void LoadInternal(ExtensionLoader &loader) {
 	    "far after transaction start is considered visible. Set to 0 for strict timestamp comparisons.",
 	    LogicalType::BIGINT, Value::BIGINT(DEFAULT_METADATA_LOG_CLOCK_SKEW_MS), SetMetadataLogClockSkew,
 	    SetScope::GLOBAL);
+	config.AddExtensionOption(
+	    WAP_BRANCH_CONFIG_VARIABLE,
+	    "Write-Audit-Publish branch, as Spark's spark.wap.branch. When set, INSERT, DELETE, UPDATE and MERGE on "
+	    "Iceberg catalog tables commit to this branch without moving main (a missing branch is created from main's "
+	    "current snapshot), and reads without an AT clause read the branch. Empty or 'main' targets main.",
+	    LogicalType::VARCHAR, Value(""), SetWapBranch);
 	config.AddExtensionOption("iceberg_use_server_side_scan_planning",
 	                          "Whether or not to use server-side scanning planning (if available)",
 	                          LogicalType::BOOLEAN, Value::BOOLEAN(false), nullptr, SetScope::GLOBAL);

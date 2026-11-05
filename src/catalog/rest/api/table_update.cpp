@@ -1,5 +1,6 @@
 #include "catalog/rest/api/table_update.hpp"
 #include "duckdb/common/exception.hpp"
+#include "duckdb/common/string_util.hpp"
 #include "catalog/rest/iceberg_table_set.hpp"
 
 namespace duckdb {
@@ -80,8 +81,12 @@ void AssertCurrentSchemaIdRequirement::CreateRequirement(DatabaseInstance &db, C
 	req.assert_current_schema_id->current_schema_id = current_schema_id;
 }
 
-AssertRefSnapshotId::AssertRefSnapshotId(int64_t snapshot_id)
-    : IcebergTableRequirement(IcebergTableRequirementType::ASSERT_REF_SNAPSHOT_ID), snapshot_id(snapshot_id) {
+AssertRefSnapshotId::AssertRefSnapshotId(int64_t snapshot_id, string ref_name_p)
+    : IcebergTableRequirement(IcebergTableRequirementType::ASSERT_REF_SNAPSHOT_ID), snapshot_id(snapshot_id),
+      ref_name(std::move(ref_name_p)) {
+	if (ref_name.empty()) {
+		throw InternalException("(AssertRefSnapshotId) Missing ref name");
+	}
 }
 
 void AssertRefSnapshotId::CreateRequirement(DatabaseInstance &db, ClientContext &context,
@@ -90,7 +95,7 @@ void AssertRefSnapshotId::CreateRequirement(DatabaseInstance &db, ClientContext 
 	auto &req = commit_state.table_change.requirements.back();
 	req.assert_ref_snapshot_id = rest_api_objects::AssertRefSnapshotId();
 	req.assert_ref_snapshot_id->type = "assert-ref-snapshot-id";
-	req.assert_ref_snapshot_id->ref = "main";
+	req.assert_ref_snapshot_id->ref = ref_name;
 	req.assert_ref_snapshot_id->snapshot_id = snapshot_id;
 }
 
@@ -287,10 +292,16 @@ void SetSnapshotRef::CreateUpdate(DatabaseInstance &db, ClientContext &context,
 	if (refs) {
 		auto entry = refs->additional_properties.find(ref_name);
 		if (entry != refs->additional_properties.end()) {
+			if (!StringUtil::CIEquals(entry->second.type, "branch")) {
+				//! A commit must never move a tag
+				throw InvalidInputException("Cannot commit to Iceberg ref '%s': it is a %s, not a branch", ref_name,
+				                            entry->second.type);
+			}
 			// Updating the snapshot ID must preserve the reference's retention policy.
 			snapshot_reference = entry->second.Copy();
 		}
 	}
+	snapshot_reference.type = "branch";
 	snapshot_reference.snapshot_id = snapshot_id;
 }
 

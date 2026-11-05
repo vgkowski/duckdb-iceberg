@@ -205,6 +205,50 @@ optional_ptr<const IcebergSnapshot> IcebergTableMetadata::GetSnapshotByRef(const
 	return snapshot;
 }
 
+bool IcebergBranchHead::IsMain() const {
+	return branch == ICEBERG_MAIN_BRANCH;
+}
+
+IcebergBranchHead IcebergTableMetadata::GetBranchHead(const string &branch) const {
+	IcebergBranchHead head;
+	head.branch = branch.empty() ? string(ICEBERG_MAIN_BRANCH) : branch;
+	if (head.IsMain()) {
+		head.ref_snapshot = GetLatestSnapshot();
+		head.base_snapshot = head.ref_snapshot;
+		return head;
+	}
+	if (refs) {
+		auto entry = refs->additional_properties.find(head.branch);
+		if (entry != refs->additional_properties.end()) {
+			auto &ref = entry->second;
+			if (!StringUtil::CIEquals(ref.type, "branch")) {
+				throw InvalidInputException("Iceberg ref '%s' is a %s, not a branch: only branches can be written to "
+				                            "or used as '%s'",
+				                            head.branch, ref.type, WAP_BRANCH_CONFIG_VARIABLE);
+			}
+			auto snapshot = FindSnapshotByIdInternal(ref.snapshot_id);
+			if (!snapshot) {
+				throw InvalidConfigurationException(
+				    "Iceberg branch '%s' points at snapshot %s, which is not in the table metadata", head.branch,
+				    std::to_string(ref.snapshot_id));
+			}
+			head.ref_snapshot = snapshot;
+			head.base_snapshot = snapshot;
+			return head;
+		}
+	}
+	//! The commit creates the branch, starting from main
+	head.base_snapshot = GetLatestSnapshot();
+	return head;
+}
+
+IcebergSnapshotScanInfo IcebergTableMetadata::GetBranchReadSnapshot(const string &branch) const {
+	IcebergSnapshotScanInfo snapshot_info;
+	snapshot_info.snapshot = GetBranchHead(branch).base_snapshot;
+	snapshot_info.schema_id = GetCurrentSchemaId();
+	return snapshot_info;
+}
+
 IcebergSnapshotScanInfo IcebergTableMetadata::GetSnapshot(const IcebergSnapshotLookup &lookup) const {
 	IcebergSnapshotScanInfo snapshot_info;
 	switch (lookup.GetSource()) {

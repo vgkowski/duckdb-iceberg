@@ -37,6 +37,20 @@ public:
 	timestamp_ms_t timestamp_ms;
 };
 
+//! Where a write to a branch lands (see IcebergTableMetadata::GetBranchHead)
+struct IcebergBranchHead {
+	//! The branch name the commit sets ("main" for the default branch)
+	string branch;
+	//! The snapshot the branch points at now; null if the branch does not exist yet (or main has no snapshot).
+	//! The commit asserts the branch still points here.
+	optional_ptr<const IcebergSnapshot> ref_snapshot;
+	//! The snapshot the write builds on (the parent of its first snapshot): the branch's snapshot, or main's
+	//! current snapshot when the commit creates the branch
+	optional_ptr<const IcebergSnapshot> base_snapshot;
+
+	bool IsMain() const;
+};
+
 struct IcebergTableMetadataSchemas {
 public:
 	IcebergTableMetadataSchemas() = default;
@@ -92,6 +106,12 @@ public:
 	optional_ptr<const IcebergSnapshot> GetSnapshotByTimestampMS(timestamp_ms_t timestamp) const;
 	//! Resolves a branch or tag from 'refs'; throws if it is missing
 	optional_ptr<const IcebergSnapshot> GetSnapshotByRef(const string &ref_name, bool &is_branch) const;
+	//! The head a write to 'branch' builds on. "main" is the current snapshot, as before branches existed. A branch
+	//! missing from 'refs' starts at main's current snapshot (as Iceberg's SnapshotUtil.latestSnapshot); a tag throws.
+	IcebergBranchHead GetBranchHead(const string &branch) const;
+	//! What a read without an AT clause sees while 'branch' is the session's WAP branch: the branch head, read with
+	//! the table's current schema (Iceberg spec: branches use the current schema)
+	IcebergSnapshotScanInfo GetBranchReadSnapshot(const string &branch) const;
 
 	//! Version extraction and identification
 	static bool UnsafeVersionGuessingEnabled(ClientContext &context);

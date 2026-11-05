@@ -18,6 +18,34 @@ of those snapshots: the updates cannot preserve an ID that has not been assigned
 yet. After commit, further updates preserve its assigned ID. Use a business key
 to identify pending rows, rather than relying on their nullable lineage columns.
 
+## Writing to branches (Write-Audit-Publish)
+
+`SET iceberg_wap_branch = 'audit'` is the counterpart of Spark's `spark.wap.branch`.
+While it is set, INSERT, DELETE, UPDATE and MERGE on REST catalog tables commit to
+the `audit` branch: each commit builds on the branch head, asserts that the branch
+still points there, and moves only that branch. Main and the table's current
+snapshot stay where they were, so readers of main keep seeing the old state. Reads
+without an AT clause read the branch; `AT (VERSION => 'main')` still reads main.
+
+```sql
+SET iceberg_wap_branch = 'audit';
+INSERT INTO cat.db.events VALUES (3, 'c');
+SELECT snapshot_id FROM iceberg_refs(cat.db.events) WHERE name = 'audit';
+RESET iceberg_wap_branch;
+```
+
+- A branch that does not exist yet reads as main, and the first commit creates it
+  from main's current snapshot, as Spark's WAP writes do.
+- A ref that is a tag is rejected, for writes and reads.
+- Unlike Spark, the table does not need `write.wap.enabled`: the setting is never
+  silently ignored.
+- The branch is fixed for a table by the first data-changing statement of a
+  transaction. A table created in the transaction, and `iceberg_rewrite_data_files`,
+  can not target a branch. `iceberg_rollback_to_snapshot` always rolls back main.
+- Empty, `'main'` or `RESET` target main. Names that are numbers (a numeric VERSION
+  is a snapshot id), contain control characters or start or end with whitespace are
+  rejected.
+
 ## Development setup
 
 Clone the repository with its DuckDB and extension tooling submodules:

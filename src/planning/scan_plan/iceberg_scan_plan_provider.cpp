@@ -69,8 +69,9 @@ unique_ptr<IcebergScanPlanProvider> IcebergScanPlanProvider::Create(IcebergScanP
 			rest_api_objects::PlanTableScanRequest request;
 			request.snapshot_id = context.snapshot.snapshot->snapshot_id;
 			request.case_sensitive = true;
-			request.use_snapshot_schema =
-			    context.snapshot.snapshot->snapshot_id != context.metadata.current_snapshot_id;
+			//! Branch heads (including a WAP branch) read with the current schema, like main; only ids, timestamps
+			//! and tags select the snapshot's own schema
+			request.use_snapshot_schema = context.snapshot.schema_id != context.metadata.GetCurrentSchemaId();
 			unique_ptr<rest_api_objects::Predicate> server_side_filter;
 			for (auto &filter : table_filters) {
 				auto primary_index = filter.first.GetPrimaryIndex();

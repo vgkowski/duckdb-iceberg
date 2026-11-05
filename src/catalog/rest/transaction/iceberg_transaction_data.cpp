@@ -42,10 +42,12 @@ static void LoadMissingManifestCounts(ClientContext &context, const IcebergTable
 }
 
 static optional<int64_t> LoadExistingManifestList(ClientContext &context, const IcebergTableMetadata &metadata,
+                                                  const string &branch,
                                                   vector<IcebergManifestListEntry> &existing_manifest_list) {
 	existing_manifest_list.clear();
 
-	auto current_snapshot = metadata.GetLatestSnapshot();
+	//! The write builds on the target branch's head (main's current snapshot for main or a branch to be created)
+	auto current_snapshot = metadata.GetBranchHead(branch).base_snapshot;
 	if (!current_snapshot) {
 		return {};
 	}
@@ -193,11 +195,44 @@ bool IcebergTransactionData::RetryStateMatches(const IcebergTable &table) const 
 	return true;
 }
 
+const string &IcebergTransactionData::GetTargetBranch() const {
+	return target_branch;
+}
+
+void IcebergTransactionData::VerifyTargetBranch(const string &session_branch) const {
+	if (!target_branch_bound || session_branch == target_branch) {
+		return;
+	}
+	throw InvalidInputException("Table \"%s\" was changed on branch '%s' in this transaction, so it can not be used "
+	                            "with '%s' = '%s' before the transaction ends",
+	                            table_info.name, target_branch, WAP_BRANCH_CONFIG_VARIABLE, session_branch);
+}
+
+void IcebergTransactionData::BindTargetBranch(lock_guard<mutex> &guard) {
+	(void)guard;
+	auto session_branch = GetIcebergWapBranch(context);
+	if (target_branch_bound) {
+		VerifyTargetBranch(session_branch);
+		return;
+	}
+	if (session_branch != ICEBERG_MAIN_BRANCH) {
+		if (has_assert_create) {
+			throw NotImplementedException("Cannot write table \"%s\" to branch '%s': it is created in this "
+			                              "transaction, and a new table's first commit must go to main",
+			                              table_info.name, session_branch);
+		}
+		//! Throws now, rather than at commit, if the ref is a tag
+		table_info.table_metadata.GetBranchHead(session_branch);
+	}
+	target_branch = std::move(session_branch);
+	target_branch_bound = true;
+}
+
 void IcebergTransactionData::CacheExistingManifestList(lock_guard<mutex> &guard, const IcebergTableMetadata &metadata) {
 	if (!alters.empty()) {
 		return;
 	}
-	base_snapshot_id = LoadExistingManifestList(context, metadata, existing_manifest_list);
+	base_snapshot_id = LoadExistingManifestList(context, metadata, target_branch, existing_manifest_list);
 	scan_sequence_number = metadata.last_sequence_number + 1;
 }
 
@@ -208,6 +243,7 @@ void IcebergTransactionData::AddSnapshot(IcebergSnapshotOperationType operation,
 	lock_guard<mutex> guard(lock);
 
 	auto &table_metadata = table_info.table_metadata;
+	BindTargetBranch(guard);
 	CacheExistingManifestList(guard, table_metadata);
 
 	IcebergManifestContentType manifest_content_type;
@@ -258,6 +294,12 @@ void IcebergTransactionData::AddSnapshotUpdate(unique_ptr<IcebergAddSnapshot> ad
 		                            table_info.name);
 	}
 	const bool is_rewrite = add_snapshot->GetOperation() == IcebergSnapshotOperationType::REPLACE;
+	//! A rewrite is planned and validated against main's current snapshot
+	if (is_rewrite && target_branch != ICEBERG_MAIN_BRANCH) {
+		throw NotImplementedException("Cannot rewrite data files of table \"%s\" while '%s' is set to '%s'; reset it "
+		                              "to rewrite main",
+		                              table_info.name, WAP_BRANCH_CONFIG_VARIABLE, target_branch);
+	}
 	//! Multiple operators can be planned before any of them stages its snapshot.
 	if (is_rewrite && !alters.empty()) {
 		throw InvalidInputException("Cannot rewrite table \"%s\": it was already changed in this transaction",
@@ -297,6 +339,7 @@ void IcebergTransactionData::AddDeleteSnapshot(partitioned_manifest_entry_map_t 
 	lock_guard<mutex> guard(lock);
 
 	auto &table_metadata = table_info.table_metadata;
+	BindTargetBranch(guard);
 	CacheExistingManifestList(guard, table_metadata);
 
 	auto add_snapshot = make_uniq<IcebergAddSnapshot>(table_info, IcebergSnapshotOperationType::DELETE);
@@ -315,7 +358,7 @@ void IcebergTransactionData::AddUpdateSnapshot(partitioned_manifest_entry_map_t 
 	lock_guard<mutex> guard(lock);
 
 	auto &table_metadata = table_info.table_metadata;
-
+	BindTargetBranch(guard);
 	CacheExistingManifestList(guard, table_metadata);
 
 	auto data_manifest_metadata =

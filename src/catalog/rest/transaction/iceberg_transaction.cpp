@@ -97,23 +97,26 @@ static string ConstructTableUpdateJSON(rest_api_objects::CommitTableRequest &tab
 	return RESTObjectToJSONString(table_change);
 }
 
-static rest_api_objects::TableRequirement CreateAssertRefSnapshotIdRequirement(const IcebergSnapshot &old_snapshot) {
+//! The branch the commit moves must still point at the snapshot the commit builds on
+static rest_api_objects::TableRequirement CreateAssertRefSnapshotIdRequirement(const string &branch,
+                                                                               const IcebergSnapshot &old_snapshot) {
 	rest_api_objects::TableRequirement req;
 	req.assert_ref_snapshot_id = rest_api_objects::AssertRefSnapshotId();
 
 	auto &res = *req.assert_ref_snapshot_id;
-	res.ref = "main";
+	res.ref = branch;
 	res.snapshot_id = old_snapshot.snapshot_id;
 	res.type = "assert-ref-snapshot-id";
 	return req;
 }
 
-static rest_api_objects::TableRequirement CreateAssertNoSnapshotRequirement() {
+//! The branch the commit creates (or main of a table without snapshots) must still not exist
+static rest_api_objects::TableRequirement CreateAssertNoSnapshotRequirement(const string &branch) {
 	rest_api_objects::TableRequirement req;
 	req.assert_ref_snapshot_id = rest_api_objects::AssertRefSnapshotId();
 
 	auto &res = *req.assert_ref_snapshot_id;
-	res.ref = "main";
+	res.ref = branch;
 	res.type = "assert-ref-snapshot-id";
 	return req;
 }
@@ -177,7 +180,8 @@ struct IcebergRetryBackoff {
 
 static void CreateTableRequirements(DatabaseInstance &db, ClientContext &context, IcebergCommitState &commit_state,
                                     const IcebergTransactionData &transaction_data,
-                                    const optional_ptr<const IcebergSnapshot> &current_snapshot) {
+                                    const IcebergBranchHead &branch_head) {
+	auto &current_snapshot = branch_head.ref_snapshot;
 	const bool has_assert_create = transaction_data.has_assert_create;
 	for (auto &requirement : transaction_data.requirements) {
 		requirement->CreateRequirement(db, context, commit_state);
@@ -191,9 +195,10 @@ static void CreateTableRequirements(DatabaseInstance &db, ClientContext &context
 		uuid_requirement.CreateRequirement(db, context, commit_state);
 	}
 	if (current_snapshot && !transaction_data.alters.empty()) {
-		commit_state.table_change.requirements.push_back(CreateAssertRefSnapshotIdRequirement(*current_snapshot));
+		commit_state.table_change.requirements.push_back(
+		    CreateAssertRefSnapshotIdRequirement(branch_head.branch, *current_snapshot));
 	} else if (!current_snapshot && !transaction_data.alters.empty() && !has_assert_create) {
-		commit_state.table_change.requirements.push_back(CreateAssertNoSnapshotRequirement());
+		commit_state.table_change.requirements.push_back(CreateAssertNoSnapshotRequirement(branch_head.branch));
 	}
 }
 
@@ -286,8 +291,15 @@ static SingleTableStagedCommit StageSingleTableCommit(DatabaseInstance &db, Iceb
 	table_change.identifier->name = table_info.name;
 
 	auto &metadata = commit_state.table_info.table_metadata;
-	auto current_snapshot = metadata.GetLatestSnapshot();
 	auto &transaction_data = *commit_state.table_info.transaction_data;
+	//! Resolved again on every attempt, so a retry rebases onto the branch's refreshed head; throws if the ref
+	//! became a tag
+	auto branch_head = metadata.GetBranchHead(commit_state.branch);
+	if (!branch_head.IsMain() && transaction_data.has_assert_create) {
+		throw InternalException("A table created in this transaction can not be committed to branch '%s'",
+		                        branch_head.branch);
+	}
+	auto current_snapshot = branch_head.base_snapshot;
 	transaction_data.VerifyMergeDeletesComplete();
 	info.retryable = transaction_data.SupportsAppendRetry();
 	info.retry_config = IcebergRetryConfig::FromTableMetadata(metadata);
@@ -301,11 +313,12 @@ static SingleTableStagedCommit StageSingleTableCommit(DatabaseInstance &db, Iceb
 		update->CreateUpdate(db, context, commit_state);
 	}
 
-	CreateTableRequirements(db, context, commit_state, transaction_data, current_snapshot);
+	CreateTableRequirements(db, context, commit_state, transaction_data, branch_head);
 
 	if (!transaction_data.alters.empty()) {
 		auto &snapshot = *commit_state.GetLatestSnapshot();
-		SetSnapshotRef set_snapshot_ref(snapshot.snapshot_id);
+		//! Only the target branch moves; a WAP commit leaves main (and current-snapshot-id) untouched
+		SetSnapshotRef set_snapshot_ref(snapshot.snapshot_id, branch_head.branch);
 		set_snapshot_ref.CreateUpdate(db, context, commit_state);
 	}
 

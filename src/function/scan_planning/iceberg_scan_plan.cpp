@@ -2,6 +2,7 @@
 
 #include "catalog/rest/catalog_entry/table/iceberg_table.hpp"
 #include "catalog/rest/catalog_entry/table/iceberg_table_schema_version.hpp"
+#include "catalog/rest/transaction/iceberg_transaction_data.hpp"
 #include "common/iceberg_utils.hpp"
 #include "core/metadata/partition/iceberg_partition_constants.hpp"
 #include "duckdb/common/types/vector.hpp"
@@ -112,7 +113,17 @@ static unique_ptr<FunctionData> IcebergScanPlanBind(ClientContext &context, Tabl
 		}
 		table_entry = &table.Cast<IcebergTableSchemaVersion>();
 		auto &metadata = table_entry->table_info.table_metadata;
-		auto snapshot = metadata.GetSnapshot(*options.snapshot_lookup);
+		IcebergSnapshotScanInfo snapshot;
+		if (options.snapshot_lookup->IsLatest()) {
+			//! Plan what a plain read of the table sees: the session's WAP branch, or main
+			auto wap_branch = GetIcebergWapBranch(context);
+			if (table_entry->table_info.transaction_data) {
+				table_entry->table_info.transaction_data->VerifyTargetBranch(wap_branch);
+			}
+			snapshot = metadata.GetBranchReadSnapshot(wap_branch);
+		} else {
+			snapshot = metadata.GetSnapshot(*options.snapshot_lookup);
+		}
 		auto &schema = metadata.GetSchemaFromId(snapshot.schema_id);
 		auto &fs = FileSystem::GetFileSystem(context);
 		scan_info = make_shared_ptr<IcebergScanInfo>(metadata.GetMetadataPath(fs), metadata, snapshot, schema);

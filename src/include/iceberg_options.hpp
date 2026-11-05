@@ -7,6 +7,8 @@
 
 namespace duckdb {
 
+class ClientContext;
+
 static constexpr const char *VERSION_GUESSING_CONFIG_VARIABLE = "unsafe_enable_version_guessing";
 
 // The Iceberg format version used when creating a new table without an explicit
@@ -40,6 +42,18 @@ static constexpr const char *SKIP_PUFFIN_VERIFICATION_CONFIG_VARIABLE = "iceberg
 // of a positional delete (v2) or deletion vector (v3). This exists only to exercise
 // the equality-delete read path.
 static constexpr const char *ENABLE_EQUALITY_DELETES_CONFIG_VARIABLE = "__iceberg_unsafe_enable_equality_deletes";
+
+// Write-Audit-Publish branch, as Spark's 'spark.wap.branch'. When set (and not 'main'), data-changing statements
+// on REST catalog tables commit to this branch instead of main, and reads of those tables without an AT clause read
+// the branch. A missing branch is created by the first commit, based on main's current snapshot.
+static constexpr const char *WAP_BRANCH_CONFIG_VARIABLE = "iceberg_wap_branch";
+static constexpr const char *ICEBERG_MAIN_BRANCH = "main";
+static constexpr idx_t MAX_ICEBERG_BRANCH_NAME_LENGTH = 255;
+
+//! Throws if 'branch' is not acceptable as iceberg_wap_branch. The empty string (unset) is accepted.
+void ValidateIcebergBranchName(const string &branch);
+//! The validated iceberg_wap_branch of this session; "main" when the setting is unset
+string GetIcebergWapBranch(ClientContext &context);
 
 static constexpr const char *UNSAFE_STRUCT_NULL_DEFAULT_INTERP_CONFIG_VARIABLE =
     "__iceberg_unsafe_struct_null_default_interp";

@@ -543,7 +543,9 @@ void Catalog::Apply(Json &metadata, const Json &update, map<string, int64_t> &la
 			}
 		}
 		if (snapshot.At("sequence-number").Integer() <= metadata.At("last-sequence-number").Integer()) {
-			Invalid("Snapshot sequence number must increase");
+			//! A stale sequence number (e.g. after a commit to another branch) is retryable, as Iceberg's
+			//! CatalogHandlers report its RetryableValidationException as a CommitFailedException
+			throw CatalogError(409, "CommitFailedException", "Snapshot sequence number must increase");
 		}
 		if (!snapshot.Get("parent-snapshot-id").IsNull()) {
 			FindID(metadata.At("snapshots"), "snapshot-id", snapshot.At("parent-snapshot-id").Integer());
@@ -574,13 +576,30 @@ void Catalog::Apply(Json &metadata, const Json &update, map<string, int64_t> &la
 	} else if (action == "set-snapshot-ref") {
 		auto identifier = update.At("snapshot-id").Integer();
 		auto &snapshot = FindID(metadata.At("snapshots"), "snapshot-id", identifier);
-		if (update.At("ref-name").String() != "main" || update.At("type").String() != "branch") {
-			Unsupported("Only the main branch is implemented");
+		auto ref_name = update.At("ref-name").String();
+		auto type = update.At("type").String();
+		if (type != "branch" && type != "tag") {
+			Invalid("Unknown ref type: " + type);
+		}
+		if (ref_name.empty()) {
+			Invalid("Ref name can not be empty");
+		}
+		auto &refs = metadata.At("refs");
+		if (refs.Has(ref_name) && refs.At(ref_name).At("type").String() != type) {
+			Invalid("Cannot change the type of ref " + ref_name);
 		}
 		auto ref = update;
 		ref.Erase("action");
 		ref.Erase("ref-name");
-		metadata.At("refs")["main"] = std::move(ref);
+		if (ref_name != "main") {
+			//! Other branches and tags do not change the table's current snapshot
+			refs[ref_name] = std::move(ref);
+			return;
+		}
+		if (type != "branch") {
+			Invalid("main must be a branch");
+		}
+		refs["main"] = std::move(ref);
 		if (metadata.Get("current-snapshot-id") != update.At("snapshot-id")) {
 			// Publication waits for this tick before exposing the candidate.
 			auto timestamp = MaxValue(NowMillis(), request_start_ms + 1);

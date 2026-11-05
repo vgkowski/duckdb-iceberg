@@ -1,8 +1,48 @@
 #include "iceberg_options.hpp"
 #include "common/iceberg_utils.hpp"
 #include "duckdb/common/atomic.hpp"
+#include "duckdb/main/client_context.hpp"
 
 namespace duckdb {
+
+void ValidateIcebergBranchName(const string &branch) {
+	if (branch.empty()) {
+		return;
+	}
+	if (branch.size() > MAX_ICEBERG_BRANCH_NAME_LENGTH) {
+		throw InvalidInputException("'%s' must be at most %llu characters long", WAP_BRANCH_CONFIG_VARIABLE,
+		                            static_cast<uint64_t>(MAX_ICEBERG_BRANCH_NAME_LENGTH));
+	}
+	for (auto c : branch) {
+		auto byte = static_cast<unsigned char>(c);
+		if (byte < 0x20 || byte == 0x7f) {
+			throw InvalidInputException("'%s' must not contain control characters", WAP_BRANCH_CONFIG_VARIABLE);
+		}
+	}
+	if (StringUtil::CharacterIsSpace(branch.front()) || StringUtil::CharacterIsSpace(branch.back())) {
+		throw InvalidInputException("'%s' must not start or end with whitespace, got '%s'", WAP_BRANCH_CONFIG_VARIABLE,
+		                            branch);
+	}
+	//! AT (VERSION => '<n>') reads a numeric string as a snapshot id, so such a branch could not be read back by name
+	if (Value(branch).DefaultTryCastAs(LogicalType::BIGINT, nullptr, true)) {
+		throw InvalidInputException("'%s' must not be a number, since a numeric VERSION names a snapshot id, got '%s'",
+		                            WAP_BRANCH_CONFIG_VARIABLE, branch);
+	}
+}
+
+string GetIcebergWapBranch(ClientContext &context) {
+	Value value;
+	if (!context.TryGetCurrentSetting(WAP_BRANCH_CONFIG_VARIABLE, value) || value.IsNull()) {
+		return ICEBERG_MAIN_BRANCH;
+	}
+	auto branch = StringValue::Get(value);
+	//! The setter validates too; re-check so a value set through another path can not slip through
+	ValidateIcebergBranchName(branch);
+	if (branch.empty()) {
+		return ICEBERG_MAIN_BRANCH;
+	}
+	return branch;
+}
 
 IcebergOptions::IcebergOptions() : snapshot_lookup(IcebergSnapshotLookup::FromLatest()) {
 }
