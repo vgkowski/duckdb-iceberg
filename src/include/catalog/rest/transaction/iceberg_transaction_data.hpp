@@ -85,14 +85,16 @@ public:
 	bool IsVisibleIn(const IcebergSnapshotScanInfo &snapshot) const;
 	//! Whether this transaction's changes create 'branch' (it was missing when the first change was staged)
 	bool CreatesBranch(const string &branch) const;
-	//! Throws if the commit may not land on 'branch_head': the target branch was deleted (or is missing while
-	//! creating branches is disabled). Checked on every attempt, so a retry never recreates a deleted branch.
-	void VerifyCommitBranch(const IcebergBranchHead &branch_head) const;
+	//! Throws if the commit may not land on 'branch_head' of 'metadata': the target branch was deleted (or is missing
+	//! while creating branches is disabled), or the commit's first snapshot would have no parent while the table
+	//! already has snapshots. Checked on every attempt against the refreshed metadata, so a retry never recreates a
+	//! deleted branch.
+	void VerifyCommitBranch(const IcebergTableMetadata &metadata, const IcebergBranchHead &branch_head) const;
 
 private:
-	//! A branch is never created while main has no snapshot: its first snapshot would have no parent, which catalogs
-	//! exempt from the sequence-number check (see the definition)
-	[[noreturn]] void ThrowParentlessBranchCreation(const string &branch) const;
+	//! A snapshot without a parent is only committed to a table with no snapshot at all, and never creates a branch:
+	//! catalogs exempt such a snapshot from the sequence-number check (see the definition)
+	[[noreturn]] void ThrowParentlessCommit(const string &branch, bool table_has_snapshots) const;
 	//! Fix the target branch from iceberg_wap_branch on the first data-changing statement; later ones must agree.
 	//! Called with lock held.
 	void BindTargetBranch(lock_guard<mutex> &guard);

@@ -304,7 +304,7 @@ static SingleTableStagedCommit StageSingleTableCommit(DatabaseInstance &db, Iceb
 		throw InternalException("A table created in this transaction can not be committed to branch '%s'",
 		                        branch_head.branch);
 	}
-	transaction_data.VerifyCommitBranch(branch_head);
+	transaction_data.VerifyCommitBranch(metadata, branch_head);
 	auto current_snapshot = branch_head.base_snapshot;
 	transaction_data.VerifyMergeDeletesComplete();
 	info.retryable = transaction_data.SupportsAppendRetry();

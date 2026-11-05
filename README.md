@@ -44,6 +44,15 @@ RESET iceberg_wap_branch;
   snapshot would have no parent, and Iceberg catalogs skip the sequence-number check for
   such a snapshot, so a concurrent commit could leave the table's last sequence number
   lowered and later deletes not applied to newer rows.
+  For the same reason, a table that has snapshots on other refs but none on main (for
+  example an empty table another engine wrote a branch of) takes no commit without a
+  parent: inserts into main, and branches created from the missing main, fail with
+  "the table has snapshots on other refs but none on main". Publish or fast-forward main
+  to one of those snapshots first. Only a table with no snapshot at all takes a first
+  insert into main. Both checks run when the statement is bound and again on the
+  refreshed metadata of every commit attempt. One race remains that no REST requirement
+  can rule out: another engine committing a parent-less branch snapshot to a truly empty
+  table at the same time as our first insert into main.
   A commit fails if the branch it wrote to was removed while the transaction ran, rather
   than recreating it. If another engine removes the branch and recreates it before the
   commit, a retried append follows the recreated branch (as Spark's appends do); a

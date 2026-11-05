@@ -242,6 +242,11 @@ IcebergBranchHead IcebergTableMetadata::GetBranchHead(const string &branch) cons
 	return head;
 }
 
+bool IcebergTableMetadata::HasAnySnapshot() const {
+	//! 'refs' is checked too, since a catalog may load only the snapshots that refs point at
+	return current_snapshot_id.has_value() || !snapshots.empty() || (refs && !refs->additional_properties.empty());
+}
+
 IcebergSnapshotScanInfo IcebergTableMetadata::GetBranchReadSnapshot(const string &branch,
                                                                     bool branch_pending_creation) const {
 	auto head = GetBranchHead(branch);

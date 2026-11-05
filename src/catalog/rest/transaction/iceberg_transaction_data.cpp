@@ -251,7 +251,12 @@ void IcebergTransactionData::BindTargetBranch(lock_guard<mutex> &guard) {
 			                            session_branch, table_info.name, WAP_BRANCH_CREATE_MISSING_CONFIG_VARIABLE);
 		}
 		if (!target_branch_existed && !head.base_snapshot) {
-			ThrowParentlessBranchCreation(session_branch);
+			ThrowParentlessCommit(session_branch, table_info.table_metadata.HasAnySnapshot());
+		}
+	} else if (!has_assert_create) {
+		auto &metadata = table_info.table_metadata;
+		if (!metadata.GetBranchHead(session_branch).base_snapshot && metadata.HasAnySnapshot()) {
+			ThrowParentlessCommit(session_branch, true);
 		}
 	}
 	target_branch = std::move(session_branch);
@@ -267,8 +272,20 @@ bool IcebergTransactionData::CreatesBranch(const string &branch) const {
 	return target_branch_bound && !target_branch_existed && target_branch == branch && !alters.empty();
 }
 
-void IcebergTransactionData::VerifyCommitBranch(const IcebergBranchHead &branch_head) const {
-	if (branch_head.IsMain() || branch_head.ref_snapshot || alters.empty()) {
+void IcebergTransactionData::VerifyCommitBranch(const IcebergTableMetadata &metadata,
+                                                const IcebergBranchHead &branch_head) const {
+	if (alters.empty()) {
+		return;
+	}
+	if (branch_head.IsMain()) {
+		//! Checked against the refreshed metadata of every attempt: another engine may have committed to a branch
+		//! while main still has no snapshot
+		if (!branch_head.base_snapshot && metadata.HasAnySnapshot()) {
+			ThrowParentlessCommit(branch_head.branch, true);
+		}
+		return;
+	}
+	if (branch_head.ref_snapshot) {
 		return;
 	}
 	if (target_branch_existed) {
@@ -283,14 +300,22 @@ void IcebergTransactionData::VerifyCommitBranch(const IcebergBranchHead &branch_
 	}
 	if (!branch_head.base_snapshot) {
 		//! Checked against the refreshed metadata of every attempt: main may have lost its snapshot since bind
-		ThrowParentlessBranchCreation(branch_head.branch);
+		ThrowParentlessCommit(branch_head.branch, metadata.HasAnySnapshot());
 	}
 }
 
-void IcebergTransactionData::ThrowParentlessBranchCreation(const string &branch) const {
-	//! The branch's first snapshot would have no parent. Iceberg catalogs (Java's TableMetadata.Builder.addSnapshot)
+void IcebergTransactionData::ThrowParentlessCommit(const string &branch, bool table_has_snapshots) const {
+	//! The commit's first snapshot would have no parent. Iceberg catalogs (Java's TableMetadata.Builder.addSnapshot)
 	//! skip the sequence-number check for such a snapshot and adopt its sequence number as last-sequence-number, so
-	//! one staged on stale metadata would lower it, and later deletes would not apply to newer data files.
+	//! one staged on stale metadata would lower it, and later deletes would not apply to newer data files. Only a
+	//! table with no snapshot at all has nothing to lower; a branch is never created that way either.
+	if (table_has_snapshots) {
+		throw InvalidInputException(
+		    "Cannot commit to Iceberg branch '%s' of table \"%s\": the table has snapshots on other refs but none on "
+		    "main, so the new snapshot would have no parent, and catalogs do not check the sequence number of a "
+		    "snapshot without a parent. Publish or fast-forward main to one of those snapshots first",
+		    branch, table_info.name);
+	}
 	throw InvalidInputException("Cannot create Iceberg branch '%s' of table \"%s\": main has no snapshot yet, so the "
 	                            "branch would start without a parent. Insert into main first (RESET %s), then write "
 	                            "to the branch",
