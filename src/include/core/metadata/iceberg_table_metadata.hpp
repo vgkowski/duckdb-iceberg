@@ -109,8 +109,8 @@ public:
 	//! The head a write to 'branch' builds on. "main" is the current snapshot, as before branches existed. A branch
 	//! missing from 'refs' starts at main's current snapshot (as Iceberg's SnapshotUtil.latestSnapshot); a tag throws.
 	IcebergBranchHead GetBranchHead(const string &branch) const;
-	//! Whether the table has any snapshot, on main or any other ref (a ref always points at a snapshot)
-	bool HasAnySnapshot() const;
+	//! Whether 'refs' holds a branch or tag other than main
+	bool HasRefOtherThanMain() const;
 	//! What a read without an AT clause sees while 'branch' is the session's WAP branch: the branch head, read with
 	//! the table's current schema (Iceberg spec: branches use the current schema). A missing branch throws, never
 	//! falling back to main, unless 'branch_pending_creation' (this transaction's writes create it from main).

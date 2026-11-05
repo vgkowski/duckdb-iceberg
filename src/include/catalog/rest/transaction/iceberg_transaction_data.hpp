@@ -94,7 +94,7 @@ public:
 private:
 	//! A snapshot without a parent is only committed to a table with no snapshot at all, and never creates a branch:
 	//! catalogs exempt such a snapshot from the sequence-number check (see the definition)
-	[[noreturn]] void ThrowParentlessCommit(const string &branch, bool table_has_snapshots) const;
+	[[noreturn]] void ThrowParentlessCommit(const string &branch, bool table_has_other_refs) const;
 	//! Fix the target branch from iceberg_wap_branch on the first data-changing statement; later ones must agree.
 	//! Called with lock held.
 	void BindTargetBranch(lock_guard<mutex> &guard);

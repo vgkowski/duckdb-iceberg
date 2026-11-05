@@ -242,9 +242,19 @@ IcebergBranchHead IcebergTableMetadata::GetBranchHead(const string &branch) cons
 	return head;
 }
 
-bool IcebergTableMetadata::HasAnySnapshot() const {
-	//! 'refs' is checked too, since a catalog may load only the snapshots that refs point at
-	return current_snapshot_id.has_value() || !snapshots.empty() || (refs && !refs->additional_properties.empty());
+bool IcebergTableMetadata::HasRefOtherThanMain() const {
+	//! Snapshots no ref points at (e.g. kept after a CREATE OR REPLACE) do not count: a parent-less commit is stamped
+	//! with last-sequence-number + 1, above all of them. Only another ref can receive concurrent commits that a
+	//! parent-less snapshot staged on stale metadata would then undercut.
+	if (!refs) {
+		return false;
+	}
+	for (auto &entry : refs->additional_properties) {
+		if (entry.first != "main") {
+			return true;
+		}
+	}
+	return false;
 }
 
 IcebergSnapshotScanInfo IcebergTableMetadata::GetBranchReadSnapshot(const string &branch,
