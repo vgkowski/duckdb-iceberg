@@ -58,11 +58,31 @@ select count(*) from my_datalake.default.at_branch_tag AT (VERSION => '999999999
 ----
 Iceberg ref '99999999999999999999' does not exist
 
+statement error
+select count(*) from my_datalake.default.at_branch_tag AT (VERSION => '9223372036854775808');
+----
+Iceberg ref '9223372036854775808' does not exist
+
+statement error
+select count(*) from my_datalake.default.at_branch_tag AT (VERSION => '+');
+----
+Iceberg ref '+' does not exist
+
 # Digits with a sign or leading zeros are a snapshot id
 statement error
 select count(*) from my_datalake.default.at_branch_tag AT (VERSION => '007');
 ----
 Could not find snapshot with id 7
+
+statement error
+select count(*) from my_datalake.default.at_branch_tag AT (VERSION => '+5');
+----
+Could not find snapshot with id 5
+
+statement error
+select count(*) from my_datalake.default.at_branch_tag AT (VERSION => '-9223372036854775808');
+----
+Could not find snapshot with id -9223372036854775808
 
 # A numeric string is still a snapshot id
 statement ok

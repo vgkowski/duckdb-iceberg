@@ -14,11 +14,13 @@ require iceberg
 #   Both snapshots were written with schema 0; the current schema 1 adds column l_added.
 
 query II
-select name, type from iceberg_refs('data/persistent/iceberg/lineitem_iceberg', version = '2-refs') order by name;
+select name, type from iceberg_refs('data/persistent/iceberg/lineitem_iceberg', version = '2-refs') order by name collate "binary";
 ----
 42	TAG
+Dev	BRANCH
 audit	BRANCH
 dangling	TAG
+dev	BRANCH
 main	BRANCH
 v1	TAG
 weird	BOGUS
@@ -83,7 +85,17 @@ select count(*) > 0 from iceberg_scan_plan('data/persistent/iceberg/lineitem_ice
 ----
 true
 
-# Ref names are case-sensitive
+# Ref names are case-sensitive: 'Dev' and 'dev' are different refs
+query I
+select count(*) from iceberg_scan('data/persistent/iceberg/lineitem_iceberg', version = '2-refs', allow_moved_paths = true, snapshot_from_ref = 'Dev');
+----
+51793
+
+query I
+select count(*) from iceberg_scan('data/persistent/iceberg/lineitem_iceberg', version = '2-refs', allow_moved_paths = true, snapshot_from_ref = 'dev');
+----
+60175
+
 statement error
 select count(*) from iceberg_scan('data/persistent/iceberg/lineitem_iceberg', version = '2-refs', allow_moved_paths = true, snapshot_from_ref = 'AUDIT');
 ----
@@ -92,7 +104,7 @@ Iceberg ref 'AUDIT' does not exist
 statement error
 select count(*) from iceberg_scan('data/persistent/iceberg/lineitem_iceberg', version = '2-refs', allow_moved_paths = true, snapshot_from_ref = 'nope');
 ----
-Iceberg ref 'nope' does not exist (available refs: 42, audit, dangling, main, v1, weird)
+Iceberg ref 'nope' does not exist (available refs: 42, Dev, audit, dangling, dev, main, v1, weird)
 
 statement error
 select count(*) from iceberg_scan('data/persistent/iceberg/lineitem_iceberg', version = '2-refs', allow_moved_paths = true, snapshot_from_ref = 'dangling');

@@ -161,8 +161,7 @@ optional_ptr<const IcebergSnapshot> IcebergTableMetadata::GetSnapshotByRef(const
 	string ref_type;
 	if (refs) {
 		auto entry = refs->additional_properties.find(ref_name);
-		//! The parsed map ignores case, but Iceberg ref names are case-sensitive
-		if (entry != refs->additional_properties.end() && entry->first == ref_name) {
+		if (entry != refs->additional_properties.end()) {
 			snapshot_id = entry->second.snapshot_id;
 			ref_type = StringUtil::Lower(entry->second.type);
 		}
@@ -191,8 +190,11 @@ optional_ptr<const IcebergSnapshot> IcebergTableMetadata::GetSnapshotByRef(const
 		throw InvalidInputException("Iceberg ref '%s' does not exist (available refs: %s)", ref_name, listed);
 	}
 	if (ref_type != "branch" && ref_type != "tag") {
+		//! The type comes from metadata, so keep the message bounded
+		static constexpr idx_t MAX_TYPE_LENGTH = 64;
+		auto shown_type = ref_type.size() > MAX_TYPE_LENGTH ? ref_type.substr(0, MAX_TYPE_LENGTH) + "..." : ref_type;
 		throw InvalidConfigurationException("Iceberg ref '%s' has unknown type '%s', expected 'branch' or 'tag'",
-		                                    ref_name, ref_type);
+		                                    ref_name, shown_type);
 	}
 	is_branch = ref_type == "branch";
 	auto snapshot = FindSnapshotByIdInternal(*snapshot_id);
@@ -222,8 +224,11 @@ IcebergSnapshotScanInfo IcebergTableMetadata::GetSnapshot(const IcebergSnapshotL
 		//! Iceberg spec "Schema selection with branches and tags": a branch reads with the table's
 		//! current schema, a tag with the schema of its snapshot
 		snapshot_info.schema_id = is_branch ? GetCurrentSchemaId() : snapshot_info.snapshot->GetSchemaId();
-		//! Reading 'main' explicitly must match a plain read, including this transaction's own writes
-		snapshot_info.is_transaction_head = ref.name == "main";
+		//! Reading 'main' explicitly must match a plain read, including this transaction's own writes.
+		//! Only when 'main' really is the transaction's base: out-of-spec metadata can have refs.main differ
+		//! from current-snapshot-id, and mixing the two would give an inconsistent read.
+		snapshot_info.is_transaction_head = is_branch && ref.name == "main" && current_snapshot_id &&
+		                                    snapshot_info.snapshot->snapshot_id == *current_snapshot_id;
 		return snapshot_info;
 	}
 	case SnapshotSource::FROM_TIMESTAMP:

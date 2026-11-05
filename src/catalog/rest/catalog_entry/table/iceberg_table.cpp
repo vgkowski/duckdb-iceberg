@@ -654,17 +654,17 @@ void IcebergTable::SetSortedBy(IcebergTransaction &transaction, const vector<Ord
 }
 
 optional_ptr<CatalogEntry> IcebergTable::GetSchemaVersion(optional_ptr<BoundAtClause> at) {
+	int32_t schema_id;
 	if (table_metadata.snapshots.empty()) {
-		return schema_versions[table_metadata.GetCurrentSchemaId()].get();
+		schema_id = table_metadata.GetCurrentSchemaId();
+	} else {
+		D_ASSERT(!schema_versions.empty());
+		auto snapshot_lookup = IcebergSnapshotLookup::FromAtClause(at);
+		auto snapshot_info = table_metadata.GetSnapshot(snapshot_lookup);
+		//! GetSnapshot picks the schema per source: current for latest and branches, the snapshot's for ids,
+		//! timestamps and tags
+		schema_id = snapshot_info.snapshot ? snapshot_info.schema_id : table_metadata.GetCurrentSchemaId();
 	}
-
-	D_ASSERT(!schema_versions.empty());
-	auto snapshot_lookup = IcebergSnapshotLookup::FromAtClause(at);
-	auto snapshot_info = table_metadata.GetSnapshot(snapshot_lookup);
-
-	//! GetSnapshot picks the schema per source: current for latest and branches, the snapshot's for ids,
-	//! timestamps and tags
-	auto schema_id = snapshot_info.snapshot ? snapshot_info.schema_id : table_metadata.GetCurrentSchemaId();
 	auto entry = schema_versions.find(schema_id);
 	if (entry == schema_versions.end() || !entry->second) {
 		throw InvalidConfigurationException("Schema id %d not found in Iceberg metadata", schema_id);

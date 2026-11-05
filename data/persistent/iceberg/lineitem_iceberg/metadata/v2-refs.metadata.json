@@ -263,6 +263,14 @@
     "weird": {
       "snapshot-id": 7817332053627255703,
       "type": "bogus"
+    },
+    "Dev": {
+      "snapshot-id": 2354745328521181395,
+      "type": "branch"
+    },
+    "dev": {
+      "snapshot-id": 7817332053627255703,
+      "type": "branch"
     }
   },
   "snapshots": [
