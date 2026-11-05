@@ -507,9 +507,10 @@ static constexpr const char *STALE_SEQUENCE_INFIX = " older than last sequence n
 
 //! A commit whose assert-ref-snapshot-id held, while a concurrent commit to another branch of the same table (WAP,
 //! or main while this commit targets a branch) advanced last-sequence-number past the one this attempt was staged
-//! on. Iceberg's TableMetadata builder then rejects the add-snapshot: the Java REST handlers (iceberg-rest-fixture
-//! 1.10.1, Polaris, Gravitino) answer 400 ValidationException "Cannot add snapshot with sequence number N older than
-//! last sequence number M". Other catalogs word or type it differently; their 400 is reported as is.
+//! on. Iceberg's TableMetadata builder then rejects the add-snapshot. Servers built on Iceberg's Java library before
+//! 1.11 (e.g. iceberg-rest-fixture 1.10.1, Polaris 1.4) answer a non-retryable 400 ValidationException "Cannot add
+//! snapshot with sequence number N older than last sequence number M" (apache/iceberg#15001); 1.11 and later answer
+//! 409 (apache/iceberg#15126), handled by the usual conflict retry. Other servers' 400s are reported as is.
 static bool IsStaleSequenceRejection(const CommitResult &result) {
 	if (result.status != HTTPStatusCode::BadRequest_400 || !result.error_) {
 		return false;

@@ -41,9 +41,12 @@ RESET iceberg_wap_branch;
   branch first, only INSERT creates one. `SET iceberg_wap_branch_create_missing = false`
   makes writes to a missing branch fail too, so a mistyped name can not create a branch.
   A branch is not created while main has no snapshot (insert into main first): its first
-  snapshot would have no parent, and Iceberg catalogs skip the sequence-number check for
-  such a snapshot, so a concurrent commit could leave the table's last sequence number
-  lowered and later deletes not applied to newer rows.
+  snapshot would have no parent. REST catalog servers built on Iceberg's Java library
+  check a new snapshot's sequence number only when it has a parent, then adopt it as the
+  table's last sequence number (`TableMetadata.addSnapshot`). This client stamps a
+  commit's first attempt from the metadata it loaded when the statement was bound, so if
+  another commit advanced the table meanwhile, such a server would lower the table's last
+  sequence number, and later deletes would not apply to newer rows.
   For the same reason, a table whose main has no snapshot but which has other branches
   (for example an empty table another engine wrote a branch of) takes no commit without a
   parent: inserts into main, and branches created from the missing main, fail with "main
@@ -52,29 +55,36 @@ RESET iceberg_wap_branch;
   commit to tags. A table with no branch other than main takes a first insert into main,
   including one whose old snapshots are unreferenced after a `CREATE OR REPLACE` (the new
   snapshot's sequence number is above all of them). Both checks run when the statement
-  is bound and again on the refreshed metadata of every commit attempt, but the first
-  attempt is staged on the metadata loaded at bind. So one race remains that no REST
-  requirement can rule out: another engine adding snapshots to the table (to a new
-  branch, or staged without a ref as with Spark's `spark.wap.id`) while our first insert
-  into main is in flight. Avoid writing to such a table from two engines at once until
-  main exists.
+  is bound and again on the refreshed metadata of every commit attempt. One case is left,
+  because the REST requirements can not assert a table's last sequence number: another
+  engine adding snapshots to the table (to a new branch, or staged without a ref as with
+  Spark's `spark.wap.id`) between our bind and our first insert into main. Avoid writing
+  to a table from two engines at once until main has a snapshot.
   A commit fails if the branch it wrote to was removed while the transaction ran, rather
   than recreating it. If another engine removes the branch and recreates it before the
   commit, a retried append follows the recreated branch (as Spark's appends do); a
   retried DELETE does not, see below.
 - Commits to different branches of one table (main included) race on the table-wide
-  sequence number. Catalogs built on Iceberg's Java REST handlers (iceberg-rest-fixture,
-  checked with 1.10.1; Polaris; Gravitino) reject the slower commit with HTTP 400
-  `ValidationException` "Cannot add snapshot with sequence number N older than last
-  sequence number M". That rejection commits nothing, so appends, and DELETEs allowed to
-  retry, are re-staged on refreshed metadata, but only when the message names a number
-  this commit stamped on one of its new snapshots of a table (N within that range, N at
-  most M) and the refreshed metadata of that table shows its last sequence number at
-  least M, so another commit advanced it; otherwise the catalog's error is reported.
-  Catalogs that word or type this rejection differently report the 400 as an error and
-  nothing is retried. UPDATE, MERGE and DELETEs that may not retry fail with "conflicts
-  with a concurrent commit to another branch", naming the rejected table and quoting the
-  catalog's message; re-run them. A retried DELETE is re-applied only if its branch still descends
+  sequence number. How the slower commit is rejected depends on the catalog server, not
+  on the client:
+  - Servers built on Iceberg's Java library before 1.11 (for example
+    `apache/iceberg-rest-fixture:1.10.1` and Polaris 1.4, both used in this repository's
+    tests) answer HTTP 400 `ValidationException` "Cannot add snapshot with sequence
+    number N older than last sequence number M", which Iceberg clients do not retry
+    ([apache/iceberg#15001](https://github.com/apache/iceberg/issues/15001)). This
+    extension retries that 400 for appends, and DELETEs allowed to retry, re-staging on
+    refreshed metadata, but only when N is a number this commit stamped on one of its new
+    snapshots, N is at most M, and the refreshed metadata shows the table's last sequence
+    number at least M; otherwise the catalog's error is reported.
+  - Servers built on Iceberg's Java library 1.11 or later answer HTTP 409 instead
+    ([apache/iceberg#15126](https://github.com/apache/iceberg/pull/15126)), which the
+    usual conflict retry handles.
+  - Other servers (for example Lakekeeper or Nessie) were not tested for this case; a
+    rejection worded or typed differently is reported as an error and not retried.
+
+  UPDATE, MERGE and DELETEs that may not retry fail with "conflicts with a concurrent
+  commit to another branch", naming the rejected table and quoting the catalog's
+  message; re-run them. A retried DELETE is re-applied only if its branch still descends
   from the snapshot it read through appends alone, so a branch reset or recreated
   meanwhile aborts.
 - Metadata functions (`iceberg_metadata`, `iceberg_files`, `iceberg_manifests`,
