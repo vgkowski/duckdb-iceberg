@@ -244,9 +244,9 @@ IcebergBranchHead IcebergTableMetadata::GetBranchHead(const string &branch) cons
 
 bool IcebergTableMetadata::HasBranchOtherThanMain() const {
 	//! Snapshots no ref points at (e.g. kept after a CREATE OR REPLACE) do not count: a parent-less commit is stamped
-	//! with last-sequence-number + 1, above all of them. Tags do not count either, since they never receive commits.
-	//! Only another branch can receive concurrent commits that a parent-less snapshot staged on stale metadata would
-	//! then undercut. An unknown ref type counts as a branch, to fail closed.
+	//! with last-sequence-number + 1, above all of them. Tags do not count either: Iceberg engines do not commit to
+	//! tags. Only another branch can receive concurrent commits that a parent-less snapshot staged on stale metadata
+	//! would then undercut. An unknown ref type counts as a branch, to fail closed.
 	if (!refs) {
 		return false;
 	}

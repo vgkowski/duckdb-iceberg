@@ -48,15 +48,16 @@ RESET iceberg_wap_branch;
   (for example an empty table another engine wrote a branch of) takes no commit without a
   parent: inserts into main, and branches created from the missing main, fail with "main
   has no snapshot but the table has other branches". Drop the other branches, or set
-  main with another engine first. Tags do not block this, since they never receive
-  commits. A table with no branch other than main takes a first insert into main,
+  main with another engine first. Tags do not block this, since Iceberg engines do not
+  commit to tags. A table with no branch other than main takes a first insert into main,
   including one whose old snapshots are unreferenced after a `CREATE OR REPLACE` (the new
   snapshot's sequence number is above all of them). Both checks run when the statement
   is bound and again on the refreshed metadata of every commit attempt, but the first
   attempt is staged on the metadata loaded at bind. So one race remains that no REST
-  requirement can rule out: another engine creating a branch (without a parent, or from
-  an unreferenced snapshot) and committing to it while our first insert into main is in
-  flight. Avoid writing to such a table from two engines at once until main exists.
+  requirement can rule out: another engine adding snapshots to the table (to a new
+  branch, or staged without a ref as with Spark's `spark.wap.id`) while our first insert
+  into main is in flight. Avoid writing to such a table from two engines at once until
+  main exists.
   A commit fails if the branch it wrote to was removed while the transaction ran, rather
   than recreating it. If another engine removes the branch and recreates it before the
   commit, a retried append follows the recreated branch (as Spark's appends do); a

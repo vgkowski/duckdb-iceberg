@@ -374,7 +374,7 @@ statement ok
 DROP TABLE my_datalake.default.wap_empty;
 
 # ---------------------------------------------------------------------------
-# A table whose main has no snapshot but which has other refs (as another engine leaves an empty table it wrote a branch
+# A table whose main has no snapshot but which has other branches (as another engine leaves an empty table it wrote a branch
 # of) refuses every commit without a parent: catalogs do not check a parent-less snapshot's sequence number, so one
 # staged on stale metadata could lower last-sequence-number and later deletes would miss newer rows. Only a table with
 # no branch other than main takes a parent-less commit. The mock can not remove main, so the load response is scripted.
