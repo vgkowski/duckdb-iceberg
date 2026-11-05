@@ -555,6 +555,16 @@ void Catalog::Apply(Json &metadata, const Json &update, map<string, int64_t> &la
 			                       " older than last sequence number " +
 			                       std::to_string(metadata.At("last-sequence-number").Integer()));
 		}
+		//! Stricter than Java on purpose: Java adopts an exempt (parent-less or v1) snapshot's sequence number as
+		//! last-sequence-number even when it is lower. A client that stamped such a snapshot from stale metadata
+		//! would then lower last-sequence-number, and later deletes would not apply to newer data files. Refusing
+		//! it here makes the test suite catch that client bug instead of silently losing deletes.
+		if (snapshot.At("sequence-number").Integer() < metadata.At("last-sequence-number").Integer()) {
+			throw CatalogError(400, "ValidationException",
+			                   "Mock catalog refuses to lower last-sequence-number from " +
+			                       std::to_string(metadata.At("last-sequence-number").Integer()) + " to " +
+			                       std::to_string(snapshot.At("sequence-number").Integer()));
+		}
 		if (!snapshot.Get("parent-snapshot-id").IsNull()) {
 			FindID(metadata.At("snapshots"), "snapshot-id", snapshot.At("parent-snapshot-id").Integer());
 		}

@@ -40,6 +40,10 @@ RESET iceberg_wap_branch;
   transaction then reads its pending state. Since DELETE, UPDATE and MERGE read the
   branch first, only INSERT creates one. `SET iceberg_wap_branch_create_missing = false`
   makes writes to a missing branch fail too, so a mistyped name can not create a branch.
+  A branch is not created while main has no snapshot (insert into main first): its first
+  snapshot would have no parent, and Iceberg catalogs skip the sequence-number check for
+  such a snapshot, so a concurrent commit could leave the table's last sequence number
+  lowered and later deletes not applied to newer rows.
   A commit fails if the branch it wrote to was removed while the transaction ran, rather
   than recreating it. If another engine removes the branch and recreates it before the
   commit, a retried append follows the recreated branch (as Spark's appends do); a
@@ -50,12 +54,13 @@ RESET iceberg_wap_branch;
   `ValidationException` "Cannot add snapshot with sequence number N older than last
   sequence number M". That rejection commits nothing, so appends, and DELETEs allowed to
   retry, are re-staged on refreshed metadata, but only when the message names a number
-  this commit staged (N at or above the first one, N at most M) and the refreshed
-  metadata shows that another commit advanced the table's last sequence number to at
-  least M; otherwise the catalog's error is reported. Catalogs that word or type this
-  rejection differently report the 400 as an error and nothing is retried. UPDATE, MERGE
-  and DELETEs that may not retry fail with "conflicts with a concurrent commit to another
-  branch"; re-run them. A retried DELETE is re-applied only if its branch still descends
+  this commit stamped on one of its new snapshots of a table (N within that range, N at
+  most M) and the refreshed metadata of that table shows its last sequence number at
+  least M, so another commit advanced it; otherwise the catalog's error is reported.
+  Catalogs that word or type this rejection differently report the 400 as an error and
+  nothing is retried. UPDATE, MERGE and DELETEs that may not retry fail with "conflicts
+  with a concurrent commit to another branch", naming the rejected table and quoting the
+  catalog's message; re-run them. A retried DELETE is re-applied only if its branch still descends
   from the snapshot it read through appends alone, so a branch reset or recreated
   meanwhile aborts.
 - Metadata functions (`iceberg_metadata`, `iceberg_files`, `iceberg_manifests`,

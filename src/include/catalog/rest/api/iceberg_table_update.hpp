@@ -61,6 +61,9 @@ public:
 
 	//! The head the commit builds on, for the branch it targets
 	IcebergBranchHead GetBranchHead() const;
+	//! The sequence numbers stamped on the snapshots written so far: [first, last], empty if none was written
+	sequence_number_t FirstStagedSequenceNumber() const;
+	sequence_number_t LastStagedSequenceNumber() const;
 
 public:
 	const IcebergTable &table_info;
@@ -80,6 +83,8 @@ private:
 	vector<IcebergManifestListEntry> manifests;
 	//! Earlier snapshots are retained in table_change; only the latest is needed as the next parent.
 	optional<IcebergSnapshot> written_snapshot;
+	//! The sequence number of the first snapshot this commit writes (the staged-on last-sequence-number + 1)
+	sequence_number_t first_sequence_number;
 	sequence_number_t next_sequence_number;
 	IcebergRowIdAllocator row_ids;
 };

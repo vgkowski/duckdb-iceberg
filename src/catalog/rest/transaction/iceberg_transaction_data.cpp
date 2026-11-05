@@ -202,14 +202,18 @@ IcebergSnapshotScanInfo GetWapReadSnapshot(ClientContext &context, const Iceberg
 	if (transaction_data) {
 		transaction_data->VerifyTargetBranch(wap_branch);
 		if (wap_branch != ICEBERG_MAIN_BRANCH && transaction_data->has_assert_create) {
-			//! A new table has no branches until its first commit, which must go to main
-			throw InvalidInputException("Table \"%s\" is created in this transaction, so it has no branch '%s' to "
-			                            "read; read it with AT (VERSION => 'main') or RESET %s",
-			                            transaction_data->table_info.name, wap_branch, WAP_BRANCH_CONFIG_VARIABLE);
+			ThrowWapReadOfCreatedTable(transaction_data->table_info.name, wap_branch);
 		}
 		pending_creation = transaction_data->CreatesBranch(wap_branch);
 	}
 	return metadata.GetBranchReadSnapshot(wap_branch, pending_creation);
+}
+
+void ThrowWapReadOfCreatedTable(const string &table_name, const string &wap_branch) {
+	//! A new table has no branches until its first commit, which must go to main
+	throw InvalidInputException("Table \"%s\" is created in this transaction, so it has no branch '%s' to read; read "
+	                            "it with AT (VERSION => 'main') or RESET %s",
+	                            table_name, wap_branch, WAP_BRANCH_CONFIG_VARIABLE);
 }
 
 const string &IcebergTransactionData::GetTargetBranch() const {
@@ -246,6 +250,9 @@ void IcebergTransactionData::BindTargetBranch(lock_guard<mutex> &guard) {
 			throw InvalidInputException("Iceberg branch '%s' does not exist in table \"%s\", and '%s' is false",
 			                            session_branch, table_info.name, WAP_BRANCH_CREATE_MISSING_CONFIG_VARIABLE);
 		}
+		if (!target_branch_existed && !head.base_snapshot) {
+			ThrowParentlessBranchCreation(session_branch);
+		}
 	}
 	target_branch = std::move(session_branch);
 	target_branch_bound = true;
@@ -274,6 +281,20 @@ void IcebergTransactionData::VerifyCommitBranch(const IcebergBranchHead &branch_
 		throw InvalidInputException("Iceberg branch '%s' does not exist in table \"%s\", and '%s' is false",
 		                            branch_head.branch, table_info.name, WAP_BRANCH_CREATE_MISSING_CONFIG_VARIABLE);
 	}
+	if (!branch_head.base_snapshot) {
+		//! Checked against the refreshed metadata of every attempt: main may have lost its snapshot since bind
+		ThrowParentlessBranchCreation(branch_head.branch);
+	}
+}
+
+void IcebergTransactionData::ThrowParentlessBranchCreation(const string &branch) const {
+	//! The branch's first snapshot would have no parent. Iceberg catalogs (Java's TableMetadata.Builder.addSnapshot)
+	//! skip the sequence-number check for such a snapshot and adopt its sequence number as last-sequence-number, so
+	//! one staged on stale metadata would lower it, and later deletes would not apply to newer data files.
+	throw InvalidInputException("Cannot create Iceberg branch '%s' of table \"%s\": main has no snapshot yet, so the "
+	                            "branch would start without a parent. Insert into main first (RESET %s), then write "
+	                            "to the branch",
+	                            branch, table_info.name, WAP_BRANCH_CONFIG_VARIABLE);
 }
 
 void IcebergTransactionData::CacheExistingManifestList(lock_guard<mutex> &guard, const IcebergTableMetadata &metadata) {

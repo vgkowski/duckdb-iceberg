@@ -61,7 +61,8 @@ static string GetCommitBranch(const IcebergTable &table_info) {
 
 IcebergCommitState::IcebergCommitState(const IcebergTable &table_info, ClientContext &context)
     : format_metadata(CreateFormatMetadata(table_info)), table_info(table_info), context(context),
-      branch(GetCommitBranch(table_info)), next_sequence_number(GetTableMetadata().last_sequence_number + 1),
+      branch(GetCommitBranch(table_info)), first_sequence_number(GetTableMetadata().last_sequence_number + 1),
+      next_sequence_number(first_sequence_number),
       row_ids(GetTableMetadata().iceberg_version >= 3 ? GetTableMetadata().next_row_id.value_or(0) : 0) {
 }
 
@@ -80,6 +81,14 @@ optional_ptr<const IcebergSnapshot> IcebergCommitState::GetLatestSnapshot() cons
 
 IcebergBranchHead IcebergCommitState::GetBranchHead() const {
 	return GetTableMetadata().GetBranchHead(branch);
+}
+
+sequence_number_t IcebergCommitState::FirstStagedSequenceNumber() const {
+	return first_sequence_number;
+}
+
+sequence_number_t IcebergCommitState::LastStagedSequenceNumber() const {
+	return next_sequence_number - 1;
 }
 
 int64_t IcebergCommitState::ReconstructTotalFilesSize(int32_t schema_id) {

@@ -338,7 +338,8 @@ statement ok
 DROP TABLE my_datalake.default.wap_safe;
 
 # ---------------------------------------------------------------------------
-# A branch write to a table whose main has no snapshot leaves main empty
+# A branch write to a table whose main has no snapshot is refused and leaves the table empty: the branch's first
+# snapshot would have no parent, which catalogs exempt from the sequence-number check
 
 statement ok
 CREATE TABLE my_datalake.default.wap_empty (id INTEGER);
@@ -346,18 +347,10 @@ CREATE TABLE my_datalake.default.wap_empty (id INTEGER);
 statement ok
 SET iceberg_wap_branch = 'audit';
 
-statement ok
+statement error
 INSERT INTO my_datalake.default.wap_empty VALUES (1);
-
-query I
-SELECT id FROM my_datalake.default.wap_empty;
 ----
-1
-
-query I
-SELECT parent_id IS NULL FROM iceberg_snapshots(my_datalake.default.wap_empty);
-----
-true
+Cannot create Iceberg branch 'audit' of table "wap_empty": main has no snapshot yet
 
 statement ok
 RESET iceberg_wap_branch;
@@ -367,16 +360,15 @@ SELECT count(*) FROM my_datalake.default.wap_empty;
 ----
 0
 
-query T
-SELECT name FROM iceberg_refs(my_datalake.default.wap_empty) ORDER BY name;
+query I
+SELECT count(*) FROM iceberg_snapshots(my_datalake.default.wap_empty);
 ----
-audit
+0
 
 query I
-SELECT coalesce((metadata::JSON->>'current-snapshot-id')::BIGINT, -1) = -1
-FROM iceberg_load_table_response(my_datalake.default.wap_empty);
+SELECT count(*) FROM iceberg_refs(my_datalake.default.wap_empty);
 ----
-true
+0
 
 statement ok
 DROP TABLE my_datalake.default.wap_empty;

@@ -29,6 +29,10 @@ struct IcebergTransactionData;
 IcebergSnapshotScanInfo GetWapReadSnapshot(ClientContext &context, const IcebergTableMetadata &metadata,
                                            optional_ptr<const IcebergTransactionData> transaction_data);
 
+//! A table created in this transaction has no branches until its first commit (to main), so a read of it under a
+//! non-main iceberg_wap_branch is refused with this error
+[[noreturn]] void ThrowWapReadOfCreatedTable(const string &table_name, const string &wap_branch);
+
 struct IcebergTransactionData {
 public:
 	IcebergTransactionData(ClientContext &context, IcebergTransaction &transaction, const IcebergTable &table_info);
@@ -86,6 +90,9 @@ public:
 	void VerifyCommitBranch(const IcebergBranchHead &branch_head) const;
 
 private:
+	//! A branch is never created while main has no snapshot: its first snapshot would have no parent, which catalogs
+	//! exempt from the sequence-number check (see the definition)
+	[[noreturn]] void ThrowParentlessBranchCreation(const string &branch) const;
 	//! Fix the target branch from iceberg_wap_branch on the first data-changing statement; later ones must agree.
 	//! Called with lock held.
 	void BindTargetBranch(lock_guard<mutex> &guard);

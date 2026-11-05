@@ -164,7 +164,7 @@ INSERT INTO my_datalake.default.wap_no_retry VALUES (3);
 statement error con1
 COMMIT;
 ----
-conflicts with a concurrent commit to another branch of "wap_no_retry"; re-run
+conflicts with a concurrent commit to another branch of "wap_no_retry"; re-run the transaction (catalog: Cannot add snapshot with sequence number 2 older than last sequence number 2)
 
 query I
 SELECT count(*) FROM iceberg_refs(my_datalake.default.wap_no_retry) WHERE name = 'audit';
@@ -174,32 +174,159 @@ SELECT count(*) FROM iceberg_refs(my_datalake.default.wap_no_retry) WHERE name =
 statement ok
 DROP TABLE my_datalake.default.wap_no_retry;
 
-# As Java's TableMetadata builder, a snapshot without a parent is exempt from the sequence-number check: a branch
-# created while main has no snapshot commits beside a concurrent first commit to main, even without retries
+
+# A branch is never created while main has no snapshot: its first snapshot would have no parent, which Java catalogs
+# exempt from the sequence-number check, so a stale staged number could lower last-sequence-number
 statement ok
-CREATE TABLE my_datalake.default.wap_parentless (id INTEGER) WITH ('commit.retry.num-retries' = '0');
+CREATE TABLE my_datalake.default.wap_parentless (id INTEGER);
+
+statement error con1
+INSERT INTO my_datalake.default.wap_parentless VALUES (1);
+----
+Cannot create Iceberg branch 'audit' of table "wap_parentless": main has no snapshot yet
 
 statement ok con1
 BEGIN;
 
+statement error con1
+INSERT INTO my_datalake.default.wap_parentless VALUES (1);
+----
+Insert into main first
+
 statement ok con1
+ROLLBACK;
+
+# Concurrent commits to main, then a DELETE on main: the deleted row stays deleted and sequence numbers only grow
+statement ok
 INSERT INTO my_datalake.default.wap_parentless VALUES (1);
 
 statement ok
 INSERT INTO my_datalake.default.wap_parentless VALUES (2);
 
-statement ok con1
-COMMIT;
+statement ok
+INSERT INTO my_datalake.default.wap_parentless VALUES (3);
 
-query I con1
-SELECT id FROM my_datalake.default.wap_parentless;
-----
-1
+statement ok
+DELETE FROM my_datalake.default.wap_parentless WHERE id = 3;
 
 query I
-SELECT id FROM my_datalake.default.wap_parentless;
+SELECT id FROM my_datalake.default.wap_parentless ORDER BY id;
 ----
+1
 2
+
+query I
+SELECT count(*) FROM iceberg_refs(my_datalake.default.wap_parentless) WHERE name = 'audit';
+----
+0
 
 statement ok
 DROP TABLE my_datalake.default.wap_parentless;
+
+# Regression: a branch commit raced by two main commits is re-staged above them, so a later DELETE on main covers
+# every row it should, and no commit lowered the table's last sequence number
+statement ok
+CREATE TABLE my_datalake.default.wap_seq (id INTEGER);
+
+statement ok
+INSERT INTO my_datalake.default.wap_seq VALUES (1);
+
+statement ok con1
+BEGIN;
+
+statement ok con1
+INSERT INTO my_datalake.default.wap_seq VALUES (10);
+
+statement ok
+INSERT INTO my_datalake.default.wap_seq VALUES (2);
+
+statement ok
+INSERT INTO my_datalake.default.wap_seq VALUES (3);
+
+statement ok con1
+COMMIT;
+
+statement ok
+DELETE FROM my_datalake.default.wap_seq WHERE id = 3;
+
+query I
+SELECT id FROM my_datalake.default.wap_seq ORDER BY id;
+----
+1
+2
+
+query I con1
+SELECT count(*) FROM my_datalake.default.wap_seq WHERE id = 10;
+----
+1
+
+# Five snapshots (three main appends, the branch append, the delete) with distinct sequence numbers 1..5, the delete
+# last
+query III
+SELECT count(*), count(DISTINCT sequence_number), max(sequence_number) FROM iceberg_snapshots(my_datalake.default.wap_seq);
+----
+5	5	5
+
+query I
+SELECT operation FROM iceberg_snapshots(my_datalake.default.wap_seq) ORDER BY sequence_number DESC LIMIT 1;
+----
+delete
+
+statement ok
+DROP TABLE my_datalake.default.wap_seq;
+
+# A multi-table commit names only the table the catalog rejected, with the catalog's message
+statement ok
+CREATE TABLE my_datalake.default.wap_multi_a (id INTEGER);
+
+statement ok
+CREATE TABLE my_datalake.default.wap_multi_b (id INTEGER);
+
+statement ok
+INSERT INTO my_datalake.default.wap_multi_a VALUES (1);
+
+statement ok
+INSERT INTO my_datalake.default.wap_multi_b VALUES (1);
+
+statement ok
+INSERT INTO my_datalake.default.wap_multi_b VALUES (2);
+
+statement ok
+INSERT INTO my_datalake.default.wap_multi_b VALUES (3);
+
+statement ok
+INSERT INTO my_datalake.default.wap_multi_b VALUES (4);
+
+statement ok con1
+INSERT INTO my_datalake.default.wap_multi_a VALUES (2);
+
+statement ok con1
+INSERT INTO my_datalake.default.wap_multi_b VALUES (5);
+
+statement ok con1
+BEGIN;
+
+statement ok con1
+UPDATE my_datalake.default.wap_multi_a SET id = id + 10 WHERE id = 1;
+
+statement ok con1
+INSERT INTO my_datalake.default.wap_multi_b VALUES (6);
+
+statement ok
+INSERT INTO my_datalake.default.wap_multi_a VALUES (100);
+
+statement error con1
+COMMIT;
+----
+conflicts with a concurrent commit to another branch of "wap_multi_a"; re-run the transaction (catalog: Cannot add snapshot with sequence number 3 older than last sequence number 3)
+
+query I con1
+SELECT count(*) FROM my_datalake.default.wap_multi_b;
+----
+5
+
+statement ok
+DROP TABLE my_datalake.default.wap_multi_a;
+
+statement ok
+DROP TABLE my_datalake.default.wap_multi_b;

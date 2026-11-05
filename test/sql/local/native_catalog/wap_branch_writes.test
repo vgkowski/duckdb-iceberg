@@ -286,6 +286,35 @@ Table "wap_new" is created in this transaction, so it has no branch 'audit' to r
 statement ok
 ROLLBACK;
 
+# iceberg_scan and metadata functions give the same error
+statement ok
+BEGIN;
+
+statement ok
+CREATE TABLE my_datalake.default.wap_new (id INTEGER);
+
+statement error
+SELECT count(*) FROM iceberg_scan('my_datalake.default.wap_new');
+----
+Table "wap_new" is created in this transaction, so it has no branch 'audit' to read
+
+statement ok
+ROLLBACK;
+
+statement ok
+BEGIN;
+
+statement ok
+CREATE TABLE my_datalake.default.wap_new (id INTEGER);
+
+statement error
+SELECT count(*) FROM iceberg_files(my_datalake.default.wap_new);
+----
+Table "wap_new" is created in this transaction, so it has no branch 'audit' to read
+
+statement ok
+ROLLBACK;
+
 statement ok
 RESET iceberg_wap_branch;
 
