@@ -626,10 +626,11 @@ void Catalog::Apply(Json &metadata, const Json &update, map<string, int64_t> &la
 		if (ref_name == "main") {
 			Unsupported("Removing the main branch is not implemented");
 		}
-		if (!metadata.At("refs").Has(ref_name)) {
-			Invalid("Unknown snapshot reference");
+		// Like Java's TableMetadata.Builder.removeRef, removing an unknown ref is a no-op; a concurrent
+		// drop is caught by the requirements, which are checked before any update is applied.
+		if (metadata.At("refs").Has(ref_name)) {
+			metadata.At("refs").Erase(ref_name);
 		}
-		metadata.At("refs").Erase(ref_name);
 	} else {
 		Invalid("Unknown update action: " + action);
 	}

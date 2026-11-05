@@ -40,8 +40,13 @@ SELECT * FROM iceberg_set_current_snapshot('cat.ns.tbl', 123);   -- or a ref nam
   They are published in one atomic catalog commit that asserts every ref
   involved (and `main`, for a ref created at its current snapshot) still points
   where it was read, so a concurrent change aborts the commit; it is not retried.
+  Neither are appends to other tables committed in the same transaction.
+- Snapshot ids and retention values must be integers; fractional values are
+  refused, not rounded.
 - `iceberg_fast_forward` only moves a branch forward to a descendant snapshot;
-  `iceberg_set_current_snapshot` moves `main` to any snapshot. `main` cannot be
+  `iceberg_set_current_snapshot` moves `main` to any snapshot. In both, a
+  VARCHAR argument is always a ref name, even when it looks like a number
+  (`'123'` names a ref; pass the integer `123` for a snapshot id). `main` cannot be
   created or dropped, and a ref can change only once per transaction and not
   after the table's rows were changed in the same transaction.
 - Ref names are case-sensitive. A name made only of digits, with an optional

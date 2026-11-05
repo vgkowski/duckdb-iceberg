@@ -477,8 +477,8 @@ class Catalog:
             ref_name = update["ref-name"]
             if ref_name == "main":
                 unsupported("Removing the main branch is not implemented")
-            if ref_name not in metadata["refs"]:
-                invalid("Unknown snapshot reference")
-            del metadata["refs"][ref_name]
+            # Like Java's TableMetadata.Builder.removeRef, removing an unknown ref is a
+            # no-op; a concurrent drop is caught by the requirements, checked first.
+            metadata["refs"].pop(ref_name, None)
         else:
             invalid(f"Unknown update action: {action}")

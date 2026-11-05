@@ -125,11 +125,20 @@ int64_t GetSnapshotIdValue(const Value &value, const char *function_name, const 
 	return result->GetValue<int64_t>();
 }
 
+//! Retention values are exact integers too: a fractional value is refused rather than rounded.
 int64_t GetRetentionValue(const Value &value, const char *function_name, const string &option) {
 	if (value.IsNull()) {
 		throw InvalidInputException("%s: '%s' cannot be NULL", function_name, option);
 	}
-	auto result = value.DefaultCastAs(LogicalType::BIGINT).GetValue<int64_t>();
+	if (!value.type().IsIntegral()) {
+		throw InvalidInputException("%s: '%s' must be an integer, got %s", function_name, option,
+		                            value.type().ToString());
+	}
+	auto cast = value.DefaultTryCastAs(LogicalType::BIGINT, nullptr, true);
+	if (!cast || cast->IsNull()) {
+		throw InvalidInputException("%s: '%s' is out of range", function_name, option);
+	}
+	auto result = cast->GetValue<int64_t>();
 	if (result <= 0) {
 		throw InvalidInputException("%s: '%s' must be > 0, got %lld", function_name, option, result);
 	}
@@ -191,12 +200,12 @@ unique_ptr<FunctionData> BindManageRefs(IcebergRefOperation operation, ClientCon
 	case IcebergRefOperation::SET_CURRENT: {
 		auto &target = input.inputs[1];
 		if (target.IsNull()) {
-			throw InvalidInputException("%s: snapshot_id or ref cannot be NULL", function_name);
+			throw InvalidInputException("%s: 'snapshot_id_or_ref' cannot be NULL", function_name);
 		}
 		if (target.type().id() == LogicalTypeId::VARCHAR) {
-			result->source_ref = GetRefNameArgument(target, function_name, "ref");
+			result->source_ref = GetRefNameArgument(target, function_name, "snapshot_id_or_ref");
 		} else {
-			result->snapshot_id = GetSnapshotIdValue(target, function_name, "snapshot_id");
+			result->snapshot_id = GetSnapshotIdValue(target, function_name, "snapshot_id_or_ref");
 		}
 		names = {"previous_snapshot_id", "current_snapshot_id"};
 		return_types = {LogicalType::BIGINT, LogicalType::BIGINT};
@@ -291,9 +300,10 @@ TableFunctionSet MakeCreateRefFunctionSet() {
 	                                       .AddPositionalOnly("ref_name", LogicalType::VARCHAR));
 	fun.GetSignature().WithTypedKwargs("options", [&](TypedKwargs &options) {
 		//! ANY so that BIGINT and the UBIGINT ids of iceberg_snapshots are both accepted.
-		options.Add("snapshot_id", LogicalType::ANY).Add("max_ref_age_ms", LogicalType::BIGINT);
+		//! ANY for the retention options as well, so a fractional value is refused instead of rounded.
+		options.Add("snapshot_id", LogicalType::ANY).Add("max_ref_age_ms", LogicalType::ANY);
 		if (OPERATION == IcebergRefOperation::CREATE_BRANCH) {
-			options.Add("max_snapshot_age_ms", LogicalType::BIGINT).Add("min_snapshots_to_keep", LogicalType::BIGINT);
+			options.Add("max_snapshot_age_ms", LogicalType::ANY).Add("min_snapshots_to_keep", LogicalType::ANY);
 		}
 	});
 	function_set.AddFunction(fun);

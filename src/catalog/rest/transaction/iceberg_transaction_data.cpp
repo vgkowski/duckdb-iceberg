@@ -4,6 +4,7 @@
 
 #include "duckdb/common/multi_file/multi_file_reader.hpp"
 #include "duckdb/common/types/uuid.hpp"
+#include "duckdb/common/operator/cast_operators.hpp"
 #include "duckdb/common/string_util.hpp"
 
 #include "core/metadata/manifest/iceberg_manifest_list.hpp"
@@ -498,8 +499,9 @@ optional<ResolvedRef> FindRef(const IcebergTableMetadata &metadata, const string
 		auto &refs = metadata.refs->additional_properties;
 		auto entry = refs.find(ref_name);
 		if (entry != refs.end()) {
-			//! The same exact type match as reads (IcebergTableMetadata::GetSnapshotByRef).
-			auto &type = entry->second.type;
+			//! The same case-insensitive type match as reads (IcebergTableMetadata::GetSnapshotByRef), so
+			//! every ref that can be read can also be managed.
+			auto type = StringUtil::Lower(entry->second.type);
 			ResolvedRef result;
 			if (type == "branch") {
 				result.type = IcebergRefType::BRANCH;
@@ -508,7 +510,9 @@ optional<ResolvedRef> FindRef(const IcebergTableMetadata &metadata, const string
 			} else {
 				//! The type comes from metadata, so keep the message bounded
 				static constexpr idx_t MAX_TYPE_LENGTH = 64;
-				auto shown_type = type.size() > MAX_TYPE_LENGTH ? type.substr(0, MAX_TYPE_LENGTH) + "..." : type;
+				auto &raw_type = entry->second.type;
+				auto shown_type =
+				    raw_type.size() > MAX_TYPE_LENGTH ? raw_type.substr(0, MAX_TYPE_LENGTH) + "..." : raw_type;
 				throw InvalidConfigurationException(
 				    "Iceberg ref '%s' has unknown type '%s', expected 'branch' or 'tag'", ref_name, shown_type);
 			}
@@ -523,9 +527,17 @@ optional<ResolvedRef> FindRef(const IcebergTableMetadata &metadata, const string
 	return {};
 }
 
-ResolvedRef GetExistingRef(const IcebergTableMetadata &metadata, const string &ref_name, const char *description) {
+//! numeric_hint: a VARCHAR argument is always a ref name, so a name that parses as a snapshot id but is
+//! not a ref gets this hint appended instead of a bare "does not exist".
+ResolvedRef GetExistingRef(const IcebergTableMetadata &metadata, const string &ref_name, const char *description,
+                           const char *numeric_hint = nullptr) {
 	auto ref = FindRef(metadata, ref_name);
 	if (!ref) {
+		int64_t parsed;
+		if (numeric_hint && TryCast::Operation<string_t, int64_t>(string_t(ref_name), parsed, true)) {
+			throw InvalidInputException("%s '%s' does not exist (a VARCHAR is always a ref name; %s)", description,
+			                            ref_name, numeric_hint);
+		}
 		throw InvalidInputException("%s '%s' does not exist", description, ref_name);
 	}
 	return *ref;
@@ -653,7 +665,8 @@ IcebergRefMove IcebergTransactionData::TableFastForward(const string &branch, co
 	}
 	auto &metadata = table_info.table_metadata;
 	auto branch_ref = GetExistingRef(metadata, branch, "Branch to update");
-	auto target_ref = GetExistingRef(metadata, to, "Ref");
+	auto target_ref = GetExistingRef(metadata, to, "Ref",
+	                                 "to publish a snapshot id use iceberg_set_current_snapshot with an integer");
 	if (branch_ref.type != IcebergRefType::BRANCH) {
 		throw InvalidInputException("Ref '%s' is a tag, not a branch", branch);
 	}
@@ -701,7 +714,8 @@ IcebergRefMove IcebergTransactionData::TableSetCurrentSnapshot(optional<int64_t>
 			                            "changed in this transaction",
 			                            source_ref, table_info.name);
 		}
-		target_snapshot_id = GetExistingRef(metadata, source_ref, "Ref").snapshot_id;
+		target_snapshot_id =
+		    GetExistingRef(metadata, source_ref, "Ref", "pass an integer to select a snapshot id").snapshot_id;
 	} else {
 		target_snapshot_id = *snapshot_id;
 	}

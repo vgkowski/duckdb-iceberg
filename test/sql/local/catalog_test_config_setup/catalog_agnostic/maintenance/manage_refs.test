@@ -152,12 +152,98 @@ select * from iceberg_create_branch('my_datalake.default.manage_refs', 'x', snap
 statement error
 select * from iceberg_set_current_snapshot('my_datalake.default.manage_refs', 1.5);
 ----
-'snapshot_id' must be an integer
+'snapshot_id_or_ref' must be an integer
 
 statement error
 select * from iceberg_set_current_snapshot('my_datalake.default.manage_refs', 2.0::DOUBLE);
 ----
-'snapshot_id' must be an integer
+'snapshot_id_or_ref' must be an integer
+
+statement error
+select * from iceberg_set_current_snapshot('my_datalake.default.manage_refs', NULL);
+----
+'snapshot_id_or_ref' cannot be NULL
+
+# Retention values must be integers too, not rounded (1.7 would otherwise become 2)
+statement error
+select * from iceberg_create_branch('my_datalake.default.manage_refs', 'x', max_ref_age_ms := 1.7);
+----
+'max_ref_age_ms' must be an integer, got DECIMAL
+
+statement error
+select * from iceberg_create_branch('my_datalake.default.manage_refs', 'x', max_ref_age_ms := '5');
+----
+'max_ref_age_ms' must be an integer, got VARCHAR
+
+statement error
+select * from iceberg_create_branch('my_datalake.default.manage_refs', 'x', max_snapshot_age_ms := 1.7);
+----
+'max_snapshot_age_ms' must be an integer, got DECIMAL
+
+statement error
+select * from iceberg_create_branch('my_datalake.default.manage_refs', 'x', max_snapshot_age_ms := '5');
+----
+'max_snapshot_age_ms' must be an integer, got VARCHAR
+
+statement error
+select * from iceberg_create_branch('my_datalake.default.manage_refs', 'x', min_snapshots_to_keep := 1.7);
+----
+'min_snapshots_to_keep' must be an integer, got DECIMAL
+
+statement error
+select * from iceberg_create_branch('my_datalake.default.manage_refs', 'x', min_snapshots_to_keep := '5');
+----
+'min_snapshots_to_keep' must be an integer, got VARCHAR
+
+statement error
+select * from iceberg_create_tag('my_datalake.default.manage_refs', 'x', max_ref_age_ms := 1.7);
+----
+'max_ref_age_ms' must be an integer
+
+statement error
+select * from iceberg_create_tag('my_datalake.default.manage_refs', 'x', max_ref_age_ms := '5');
+----
+'max_ref_age_ms' must be an integer
+
+statement error
+select * from iceberg_create_branch('my_datalake.default.manage_refs', 'x', max_ref_age_ms := 18446744073709551615::UBIGINT);
+----
+'max_ref_age_ms' is out of range
+
+statement error
+select * from iceberg_create_branch('my_datalake.default.manage_refs', 'x', min_snapshots_to_keep := 3000000000);
+----
+'min_snapshots_to_keep' is too large
+
+# Integer types other than BIGINT are accepted
+query T
+select ref_name from iceberg_create_branch('my_datalake.default.manage_refs', 'int_retention', max_ref_age_ms := 86400000::UBIGINT, min_snapshots_to_keep := 2::TINYINT);
+----
+int_retention
+
+query II
+select max_reference_age_in_ms, min_snapshots_to_keep from iceberg_refs(my_datalake.default.manage_refs) where name = 'int_retention';
+----
+86400000	2
+
+statement ok
+select * from iceberg_drop_branch('my_datalake.default.manage_refs', 'int_retention');
+
+# A VARCHAR is always a ref name: a numeric one that is not a ref gets a hint
+statement error
+select * from iceberg_set_current_snapshot('my_datalake.default.manage_refs', getvariable('s1')::VARCHAR);
+----
+a VARCHAR is always a ref name; pass an integer to select a snapshot id
+
+statement error
+select * from iceberg_fast_forward('my_datalake.default.manage_refs', 'main', '123');
+----
+a VARCHAR is always a ref name; to publish a snapshot id use iceberg_set_current_snapshot
+
+statement error
+select * from iceberg_set_current_snapshot('my_datalake.default.manage_refs', 'missing');
+----
+<REGEX>:.*Ref 'missing' does not exist[^(]*
 
 # Ref names are case-sensitive
 statement error
