@@ -251,11 +251,11 @@ void IcebergTransactionData::BindTargetBranch(lock_guard<mutex> &guard) {
 			                            session_branch, table_info.name, WAP_BRANCH_CREATE_MISSING_CONFIG_VARIABLE);
 		}
 		if (!target_branch_existed && !head.base_snapshot) {
-			ThrowParentlessCommit(session_branch, table_info.table_metadata.HasRefOtherThanMain());
+			ThrowParentlessCommit(session_branch, table_info.table_metadata.HasBranchOtherThanMain());
 		}
 	} else if (!has_assert_create) {
 		auto &metadata = table_info.table_metadata;
-		if (!metadata.GetBranchHead(session_branch).base_snapshot && metadata.HasRefOtherThanMain()) {
+		if (!metadata.GetBranchHead(session_branch).base_snapshot && metadata.HasBranchOtherThanMain()) {
 			ThrowParentlessCommit(session_branch, true);
 		}
 	}
@@ -280,7 +280,7 @@ void IcebergTransactionData::VerifyCommitBranch(const IcebergTableMetadata &meta
 	if (branch_head.IsMain()) {
 		//! Checked against the refreshed metadata of every attempt: another engine may have committed to a branch
 		//! while main still has no snapshot
-		if (!branch_head.base_snapshot && metadata.HasRefOtherThanMain()) {
+		if (!branch_head.base_snapshot && metadata.HasBranchOtherThanMain()) {
 			ThrowParentlessCommit(branch_head.branch, true);
 		}
 		return;
@@ -300,22 +300,21 @@ void IcebergTransactionData::VerifyCommitBranch(const IcebergTableMetadata &meta
 	}
 	if (!branch_head.base_snapshot) {
 		//! Checked against the refreshed metadata of every attempt: main may have lost its snapshot since bind
-		ThrowParentlessCommit(branch_head.branch, metadata.HasRefOtherThanMain());
+		ThrowParentlessCommit(branch_head.branch, metadata.HasBranchOtherThanMain());
 	}
 }
 
-void IcebergTransactionData::ThrowParentlessCommit(const string &branch, bool table_has_other_refs) const {
+void IcebergTransactionData::ThrowParentlessCommit(const string &branch, bool table_has_other_branches) const {
 	//! The commit's first snapshot would have no parent. Iceberg catalogs (Java's TableMetadata.Builder.addSnapshot)
 	//! skip the sequence-number check for such a snapshot and adopt its sequence number as last-sequence-number, so
 	//! one staged on stale metadata would lower it, and later deletes would not apply to newer data files. That needs
 	//! another ref that can receive concurrent commits; without one (an empty table, or one whose old snapshots are
 	//! unreferenced after a replace) main's first commit is safe. A branch is never created without a parent.
-	if (table_has_other_refs) {
+	if (table_has_other_branches) {
 		throw InvalidInputException(
 		    "Cannot commit to Iceberg branch '%s' of table \"%s\": main has no snapshot but the table has other "
-		    "branches or tags, so the new snapshot would have no parent, and catalogs do not check the sequence "
-		    "number of a snapshot without a parent. Publish the ref you want as main first, for example with "
-		    "iceberg_set_current_snapshot",
+		    "branches, so the new snapshot would have no parent, and catalogs do not check the sequence number of "
+		    "a snapshot without a parent. Drop the other branches, or set main with another engine first",
 		    branch, table_info.name);
 	}
 	throw InvalidInputException("Cannot create Iceberg branch '%s' of table \"%s\": main has no snapshot yet, so the "

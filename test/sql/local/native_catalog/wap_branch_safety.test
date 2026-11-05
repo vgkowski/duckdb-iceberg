@@ -377,7 +377,7 @@ DROP TABLE my_datalake.default.wap_empty;
 # A table whose main has no snapshot but which has other refs (as another engine leaves an empty table it wrote a branch
 # of) refuses every commit without a parent: catalogs do not check a parent-less snapshot's sequence number, so one
 # staged on stale metadata could lower last-sequence-number and later deletes would miss newer rows. Only a table with
-# no ref other than main takes a parent-less commit. The mock can not remove main, so the load response is scripted.
+# no branch other than main takes a parent-less commit. The mock can not remove main, so the load response is scripted.
 
 statement ok
 CREATE TABLE my_datalake.default.wap_nomain (id INTEGER);
@@ -429,7 +429,7 @@ SET VARIABLE nomain_seq = (
 statement error
 INSERT INTO my_datalake.default.wap_nomain VALUES (2);
 ----
-Cannot commit to Iceberg branch 'main' of table "wap_nomain": main has no snapshot but the table has other branches or tags
+Cannot commit to Iceberg branch 'main' of table "wap_nomain": main has no snapshot but the table has other branches
 
 # Creating a new branch from the missing main is refused with the same reason
 statement ok
@@ -438,7 +438,7 @@ SET iceberg_wap_branch = 'audit2';
 statement error
 INSERT INTO my_datalake.default.wap_nomain VALUES (3);
 ----
-Cannot commit to Iceberg branch 'audit2' of table "wap_nomain": main has no snapshot but the table has other branches or tags
+Cannot commit to Iceberg branch 'audit2' of table "wap_nomain": main has no snapshot but the table has other branches
 
 statement ok
 RESET iceberg_wap_branch;
@@ -447,7 +447,11 @@ RESET iceberg_wap_branch;
 # sequence number is above all of them, and no other ref can receive concurrent commits
 statement ok
 SET VARIABLE replaced_load = (
-	SELECT json_merge_patch(body, '{"metadata": {"current-snapshot-id": null, "refs": {"main": null, "audit": null}, "snapshot-log": []}}')
+	SELECT json_merge_patch(body, json_object('metadata', json_object(
+		'current-snapshot-id', NULL,
+		'snapshot-log', json('[]'),
+		'refs', json_object('main', NULL, 'audit', NULL,
+			'release', json_object('snapshot-id', getvariable('nomain_snapshot'), 'type', 'tag')))))
 	FROM iceberg_test_catalog_request('GET', '/v1/namespaces/default/tables/wap_nomain', NULL)
 );
 
@@ -456,10 +460,11 @@ SELECT * FROM query(getvariable('script_nomain').replace('BODY', getvariable('re
 ----
 204
 
-query I
-SELECT count(*) FROM iceberg_refs(my_datalake.default.wap_nomain);
+# Only a tag is left; tags never receive commits, so they do not block the insert either
+query II
+SELECT name, type FROM iceberg_refs(my_datalake.default.wap_nomain);
 ----
-0
+release	TAG
 
 statement ok
 BEGIN;
@@ -557,7 +562,7 @@ SELECT status FROM iceberg_test_catalog_request('POST', '/__test/response',
 statement error
 COMMIT;
 ----
-Cannot commit to Iceberg branch 'main' of table "wap_nomain_race": main has no snapshot but the table has other branches or tags
+Cannot commit to Iceberg branch 'main' of table "wap_nomain_race": main has no snapshot but the table has other branches
 
 query I
 SELECT status FROM iceberg_test_catalog_request('DELETE', '/__test/response', NULL);
