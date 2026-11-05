@@ -201,6 +201,12 @@ IcebergSnapshotScanInfo GetWapReadSnapshot(ClientContext &context, const Iceberg
 	bool pending_creation = false;
 	if (transaction_data) {
 		transaction_data->VerifyTargetBranch(wap_branch);
+		if (wap_branch != ICEBERG_MAIN_BRANCH && transaction_data->has_assert_create) {
+			//! A new table has no branches until its first commit, which must go to main
+			throw InvalidInputException("Table \"%s\" is created in this transaction, so it has no branch '%s' to "
+			                            "read; read it with AT (VERSION => 'main') or RESET %s",
+			                            transaction_data->table_info.name, wap_branch, WAP_BRANCH_CONFIG_VARIABLE);
+		}
 		pending_creation = transaction_data->CreatesBranch(wap_branch);
 	}
 	return metadata.GetBranchReadSnapshot(wap_branch, pending_creation);
@@ -505,7 +511,13 @@ static bool IsAncestorOfCurrentSnapshot(const IcebergTableMetadata &metadata, in
 		return true;
 	}
 	optional_ptr<const IcebergSnapshot> cursor = metadata.FindSnapshotByIdInternal(current_snapshot_id);
-	while (cursor) {
+	//! An acyclic history visits each snapshot at most once; more steps than snapshots means a parent cycle
+	for (idx_t steps = 0; cursor; steps++) {
+		if (steps > metadata.snapshots.size()) {
+			throw InvalidConfigurationException("The snapshot history of the table contains a parent-snapshot-id "
+			                                    "cycle through snapshot %lld",
+			                                    current_snapshot_id);
+		}
 		if (!cursor->parent_snapshot_id) {
 			return false;
 		}

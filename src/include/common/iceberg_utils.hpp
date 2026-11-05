@@ -35,6 +35,8 @@ struct IcebergResolvedMetadata {
 	optional<string> wap_branch;
 	//! Whether the transaction's pending changes create 'wap_branch'
 	bool wap_branch_pending_creation = false;
+	//! The catalog table's name, for errors
+	string table_name;
 };
 
 class IcebergUtils {

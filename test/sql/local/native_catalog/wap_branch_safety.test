@@ -60,6 +60,25 @@ SET iceberg_wap_branch = '99999999999999999999';
 statement ok
 SET iceberg_wap_branch = '0x10';
 
+# Long.parseLong also reads non-ASCII decimal digits, so names containing them are rejected
+statement error
+SET iceberg_wap_branch = '١٢٣';
+----
+must not contain non-ASCII digits
+
+statement error
+SET iceberg_wap_branch = '１２';
+----
+must not contain non-ASCII digits
+
+statement error
+SET iceberg_wap_branch = 'audit-٣';
+----
+must not contain non-ASCII digits
+
+statement ok
+SET iceberg_wap_branch = 'audit-é';
+
 statement ok
 RESET iceberg_wap_branch;
 
@@ -150,6 +169,47 @@ SELECT id FROM my_datalake.default.wap_safe AT (VERSION => 'main') ORDER BY id;
 
 statement ok
 COMMIT;
+
+# iceberg_scan and metadata functions do not include pending changes, so they refuse a branch the transaction is
+# creating rather than show main's data under its name
+statement ok
+SET iceberg_wap_branch = 'audit_pending';
+
+statement ok
+BEGIN;
+
+statement ok
+INSERT INTO my_datalake.default.wap_safe VALUES (7);
+
+statement error
+SELECT count(*) FROM iceberg_scan('my_datalake.default.wap_safe');
+----
+Iceberg branch 'audit_pending' of table "wap_safe" is created by this transaction
+
+statement ok
+ROLLBACK;
+
+statement ok
+BEGIN;
+
+statement ok
+INSERT INTO my_datalake.default.wap_safe VALUES (7);
+
+statement error
+SELECT count(*) FROM iceberg_files(my_datalake.default.wap_safe);
+----
+Iceberg branch 'audit_pending' of table "wap_safe" is created by this transaction
+
+statement ok
+ROLLBACK;
+
+query I
+SELECT count(*) FROM iceberg_refs(my_datalake.default.wap_safe) WHERE name = 'audit_pending';
+----
+0
+
+statement ok
+SET iceberg_wap_branch = 'audit';
 
 statement ok
 SET VARIABLE audit_1 = (SELECT snapshot_id FROM iceberg_refs(my_datalake.default.wap_safe) WHERE name = 'audit');

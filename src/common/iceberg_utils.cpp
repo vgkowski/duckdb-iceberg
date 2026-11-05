@@ -273,6 +273,14 @@ string IcebergUtils::GetStorageLocation(ClientContext &context, const string &in
 IcebergSnapshotScanInfo IcebergResolvedMetadata::GetSnapshot(const IcebergTableMetadata &metadata_p,
                                                              const IcebergSnapshotLookup &lookup) const {
 	if (wap_branch && lookup.IsLatest()) {
+		if (wap_branch_pending_creation) {
+			//! The branch exists only in this transaction's pending changes, which these readers do not include:
+			//! main's head would be shown under the branch's name
+			throw InvalidInputException("Iceberg branch '%s' of table \"%s\" is created by this transaction; its "
+			                            "pending changes can only be read by querying the table until the "
+			                            "transaction commits",
+			                            *wap_branch, table_name);
+		}
 		return metadata_p.GetBranchReadSnapshot(*wap_branch, wap_branch_pending_creation);
 	}
 	return metadata_p.GetSnapshot(lookup);
@@ -300,6 +308,7 @@ IcebergResolvedMetadata IcebergUtils::ResolveTableMetadata(ClientContext &contex
 				resolved.wap_branch_pending_creation = transaction_data->CreatesBranch(wap_branch);
 			}
 			resolved.wap_branch = std::move(wap_branch);
+			resolved.table_name = iceberg_table.table_info.name;
 			return resolved;
 		}
 	}

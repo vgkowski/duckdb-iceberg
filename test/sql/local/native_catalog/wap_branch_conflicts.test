@@ -111,5 +111,95 @@ WHERE snapshot_id = (SELECT snapshot_id FROM iceberg_refs(my_datalake.default.wa
 ----
 true
 
+# An UPDATE is not retried, so a concurrent commit to main fails it with a conflict rather than the catalog's 400
+statement ok con1
+BEGIN;
+
+statement ok con1
+UPDATE my_datalake.default.wap_conflicts SET id = id + 10 WHERE id = 2;
+
+statement ok
+INSERT INTO my_datalake.default.wap_conflicts VALUES (101);
+
+statement error con1
+COMMIT;
+----
+conflicts with a concurrent commit to another branch of "wap_conflicts"; re-run
+
+query I con1
+SELECT id FROM my_datalake.default.wap_conflicts ORDER BY id;
+----
+2
+3
+4
+5
+6
+
+query I
+SELECT id FROM my_datalake.default.wap_conflicts ORDER BY id;
+----
+1
+100
+101
+
 statement ok
 DROP TABLE my_datalake.default.wap_conflicts;
+
+# With retries disabled, an append racing a commit to main fails with the same conflict
+statement ok
+CREATE TABLE my_datalake.default.wap_no_retry (id INTEGER) WITH ('commit.retry.num-retries' = '0');
+
+statement ok
+INSERT INTO my_datalake.default.wap_no_retry VALUES (1);
+
+statement ok con1
+BEGIN;
+
+statement ok con1
+INSERT INTO my_datalake.default.wap_no_retry VALUES (2);
+
+statement ok
+INSERT INTO my_datalake.default.wap_no_retry VALUES (3);
+
+statement error con1
+COMMIT;
+----
+conflicts with a concurrent commit to another branch of "wap_no_retry"; re-run
+
+query I
+SELECT count(*) FROM iceberg_refs(my_datalake.default.wap_no_retry) WHERE name = 'audit';
+----
+0
+
+statement ok
+DROP TABLE my_datalake.default.wap_no_retry;
+
+# As Java's TableMetadata builder, a snapshot without a parent is exempt from the sequence-number check: a branch
+# created while main has no snapshot commits beside a concurrent first commit to main, even without retries
+statement ok
+CREATE TABLE my_datalake.default.wap_parentless (id INTEGER) WITH ('commit.retry.num-retries' = '0');
+
+statement ok con1
+BEGIN;
+
+statement ok con1
+INSERT INTO my_datalake.default.wap_parentless VALUES (1);
+
+statement ok
+INSERT INTO my_datalake.default.wap_parentless VALUES (2);
+
+statement ok con1
+COMMIT;
+
+query I con1
+SELECT id FROM my_datalake.default.wap_parentless;
+----
+1
+
+query I
+SELECT id FROM my_datalake.default.wap_parentless;
+----
+2
+
+statement ok
+DROP TABLE my_datalake.default.wap_parentless;

@@ -542,7 +542,11 @@ void Catalog::Apply(Json &metadata, const Json &update, map<string, int64_t> &la
 				Invalid("Snapshot ID already exists");
 			}
 		}
-		if (snapshot.At("sequence-number").Integer() <= metadata.At("last-sequence-number").Integer()) {
+		//! As Iceberg's TableMetadata.Builder.addSnapshot: format v1 and parent-less snapshots are exempt
+		bool sequence_checked =
+		    metadata.At("format-version").Integer() != 1 && !snapshot.Get("parent-snapshot-id").IsNull();
+		if (sequence_checked &&
+		    snapshot.At("sequence-number").Integer() <= metadata.At("last-sequence-number").Integer()) {
 			//! As Iceberg's TableMetadata builder (iceberg-rest-fixture 1.10.1 answers this with a 400
 			//! ValidationException), also when a commit to another branch advanced last-sequence-number
 			throw CatalogError(400, "ValidationException",

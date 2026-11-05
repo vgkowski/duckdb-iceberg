@@ -271,6 +271,21 @@ CREATE TABLE my_datalake.default.wap_new AS SELECT 1 AS id;
 ----
 it is created in this transaction
 
+# Reading a table created in the transaction names the reason, rather than a missing branch
+statement ok
+BEGIN;
+
+statement ok
+CREATE TABLE my_datalake.default.wap_new (id INTEGER);
+
+statement error
+SELECT count(*) FROM my_datalake.default.wap_new;
+----
+Table "wap_new" is created in this transaction, so it has no branch 'audit' to read
+
+statement ok
+ROLLBACK;
+
 statement ok
 RESET iceberg_wap_branch;
 
