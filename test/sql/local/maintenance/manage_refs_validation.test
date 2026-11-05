@@ -46,3 +46,15 @@ statement error
 SELECT * FROM iceberg_create_branch(NULL, 'audit');
 ----
 table_name cannot be NULL
+
+# CALL binds through the same path
+statement error
+CALL iceberg_drop_tag('local_table', 'v1');
+----
+Cannot call iceberg_drop_tag on non-iceberg table
+
+# A URL is not probed as a local file: it is looked up as a table name only
+statement error
+SELECT * FROM iceberg_fast_forward('s3://bucket', 'main', 'audit');
+----
+<REGEX>:Catalog Error: Table with name s3://bucket does not exist.*

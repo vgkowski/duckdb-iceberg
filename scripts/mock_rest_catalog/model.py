@@ -23,6 +23,21 @@ def unsupported(message):
     raise CatalogError(501, "UnsupportedOperationException", message)
 
 
+def validate_ref_retention(ref):
+    # Mirrors Java's SnapshotRef builder: retention values are positive integers, and only
+    # branches keep snapshots, so tags refuse the snapshot-retention fields.
+    for field in ("min-snapshots-to-keep", "max-snapshot-age-ms", "max-ref-age-ms"):
+        if field not in ref or ref[field] is None:
+            continue
+        value = ref[field]
+        if isinstance(value, bool) or not isinstance(value, int) or value <= 0:
+            invalid(f"Snapshot reference {field} must be a positive integer")
+        if value > (2**31 - 1 if field == "min-snapshots-to-keep" else 2**63 - 1):
+            invalid(f"Snapshot reference {field} is out of range")
+        if ref["type"] == "tag" and field != "max-ref-age-ms":
+            invalid(f"Tags do not support {field}")
+
+
 def namespace_parts(value):
     if not isinstance(value, list) or not value or any(not isinstance(part, str) or not part for part in value):
         invalid("Namespace must contain nonempty strings")
@@ -282,6 +297,11 @@ class Catalog:
         if kind == "assert-create":
             valid = metadata is None
         elif kind == "assert-ref-snapshot-id":
+            # The spec requires snapshot-id; only an explicit null means "the ref must not exist".
+            if "snapshot-id" not in requirement:
+                invalid("assert-ref-snapshot-id requires snapshot-id")
+            if not isinstance(requirement["ref"], str):
+                invalid("assert-ref-snapshot-id requires a ref name")
             actual = metadata["refs"].get(requirement["ref"], {}).get("snapshot-id") if metadata else None
             valid = metadata is not None and actual == requirement.get("snapshot-id")
         elif kind in fields:
@@ -439,6 +459,7 @@ class Catalog:
                 invalid("Invalid snapshot reference")
             if ref_name == "main" and update["type"] != "branch":
                 invalid("The main ref must be a branch")
+            validate_ref_retention(update)
             metadata["refs"][ref_name] = {k: v for k, v in update.items() if k not in ("action", "ref-name")}
             if ref_name != "main":
                 # Only main determines the current snapshot and its history.

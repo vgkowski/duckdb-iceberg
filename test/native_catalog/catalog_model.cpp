@@ -397,6 +397,10 @@ void Catalog::CheckRequirement(const Json &metadata, const Json &requirement) co
 	if (kind == "assert-create") {
 		valid = metadata.IsNull();
 	} else if (kind == "assert-ref-snapshot-id") {
+		//! The spec requires snapshot-id; only an explicit null means "the ref must not exist".
+		if (!requirement.Has("snapshot-id")) {
+			Invalid("assert-ref-snapshot-id requires snapshot-id");
+		}
 		if (!metadata.IsNull()) {
 			auto &ref = metadata.At("refs").Get(requirement.At("ref").String());
 			valid = ref.Get("snapshot-id") == requirement.Get("snapshot-id");
@@ -581,6 +585,24 @@ void Catalog::Apply(Json &metadata, const Json &update, map<string, int64_t> &la
 		}
 		if (ref_name == "main" && type != "branch") {
 			Invalid("The main ref must be a branch");
+		}
+		// Mirrors Java's SnapshotRef builder: retention values are positive integers, and only
+		// branches keep snapshots, so tags refuse the snapshot-retention fields.
+		for (auto field : {"min-snapshots-to-keep", "max-snapshot-age-ms", "max-ref-age-ms"}) {
+			auto &value = update.Get(field);
+			if (value.IsNull()) {
+				continue;
+			}
+			auto number = value.Integer();
+			if (number <= 0) {
+				Invalid(string("Snapshot reference ") + field + " must be a positive integer");
+			}
+			if (string(field) == "min-snapshots-to-keep" && number > NumericLimits<int32_t>::Maximum()) {
+				Invalid(string("Snapshot reference ") + field + " is out of range");
+			}
+			if (type == "tag" && string(field) != "max-ref-age-ms") {
+				Invalid(string("Tags do not support ") + field);
+			}
 		}
 		auto ref = update;
 		ref.Erase("action");

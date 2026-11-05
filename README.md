@@ -18,6 +18,36 @@ of those snapshots: the updates cannot preserve an ID that has not been assigned
 yet. After commit, further updates preserve its assigned ID. Use a business key
 to identify pending rows, rather than relying on their nullable lineage columns.
 
+## Branches and tags
+
+Tables in an attached REST catalog can be read at a branch or tag with
+`AT (VERSION => 'name')`, and their refs managed with:
+
+```sql
+SELECT * FROM iceberg_create_branch('cat.ns.tbl', 'dev', snapshot_id := 123,
+    max_ref_age_ms := 86400000, max_snapshot_age_ms := 3600000, min_snapshots_to_keep := 2);
+SELECT * FROM iceberg_create_tag('cat.ns.tbl', 'v1', max_ref_age_ms := 86400000);
+SELECT * FROM iceberg_drop_branch('cat.ns.tbl', 'dev');
+SELECT * FROM iceberg_drop_tag('cat.ns.tbl', 'v1');
+SELECT * FROM iceberg_fast_forward('cat.ns.tbl', 'main', 'dev');
+SELECT * FROM iceberg_set_current_snapshot('cat.ns.tbl', 123);   -- or a ref name: 'dev'
+```
+
+- Without `snapshot_id`, a new ref points at the current snapshot of `main`.
+  Retention values must be positive; tags accept only `max_ref_age_ms`.
+- Ref changes are staged in the transaction and become visible, including to
+  `AT (VERSION => ...)` reads in the same transaction, only after it commits.
+  They are published in one atomic catalog commit that asserts every ref
+  involved (and `main`, for a ref created at its current snapshot) still points
+  where it was read, so a concurrent change aborts the commit; it is not retried.
+- `iceberg_fast_forward` only moves a branch forward to a descendant snapshot;
+  `iceberg_set_current_snapshot` moves `main` to any snapshot. `main` cannot be
+  created or dropped, and a ref can change only once per transaction and not
+  after the table's rows were changed in the same transaction.
+- Ref names are case-sensitive. A name made only of digits, with an optional
+  leading sign (such as `123` or `-7`), is refused on create: `AT (VERSION => '123')`
+  reads snapshot id 123, so such a ref could not be read by name.
+
 ## Development setup
 
 Clone the repository with its DuckDB and extension tooling submodules:

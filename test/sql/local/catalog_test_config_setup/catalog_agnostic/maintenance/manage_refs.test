@@ -128,11 +128,124 @@ select * from iceberg_create_tag('my_datalake.default.manage_refs', 'x', min_sna
 ----
 <REGEX>:.*min_snapshots_to_keep.*
 
+# A signed number reads as a snapshot id too, so it cannot name a ref
+foreach digits +12 -7 99999999999999999999999
+
+statement error
+select * from iceberg_create_tag('my_datalake.default.manage_refs', '{digits}');
+----
+cannot consist only of digits
+
+endloop
+
+# Snapshot ids must be integers, not rounded
+statement error
+select * from iceberg_create_branch('my_datalake.default.manage_refs', 'x', snapshot_id := 1.5);
+----
+'snapshot_id' must be an integer
+
+statement error
+select * from iceberg_create_branch('my_datalake.default.manage_refs', 'x', snapshot_id := '1');
+----
+'snapshot_id' must be an integer
+
+statement error
+select * from iceberg_set_current_snapshot('my_datalake.default.manage_refs', 1.5);
+----
+'snapshot_id' must be an integer
+
+statement error
+select * from iceberg_set_current_snapshot('my_datalake.default.manage_refs', 2.0::DOUBLE);
+----
+'snapshot_id' must be an integer
+
 # Ref names are case-sensitive
 statement error
 select * from iceberg_drop_branch('my_datalake.default.manage_refs', 'AUDIT');
 ----
-ref names are case-sensitive
+Iceberg ref 'AUDIT' does not exist
+
+statement ok
+select * from iceberg_create_tag('my_datalake.default.manage_refs', 'AUDIT', snapshot_id := getvariable('s1'));
+
+query TT
+select name, type from iceberg_refs(my_datalake.default.manage_refs) where lower(name) = 'audit' order by name;
+----
+AUDIT	TAG
+audit	BRANCH
+
+query I
+select list(id order by id) from my_datalake.default.manage_refs AT (VERSION => 'AUDIT');
+----
+[1]
+
+statement ok
+select * from iceberg_drop_tag('my_datalake.default.manage_refs', 'AUDIT');
+
+# One statement cannot change the same ref twice
+statement error
+select * from iceberg_create_branch('my_datalake.default.manage_refs', 'twice') AS a,
+	iceberg_create_tag('my_datalake.default.manage_refs', 'twice') AS b;
+----
+it was already changed in this transaction
+
+statement error
+select * from iceberg_set_current_snapshot('my_datalake.default.manage_refs', getvariable('s1')) AS a,
+	iceberg_set_current_snapshot('my_datalake.default.manage_refs', getvariable('s2')) AS b;
+----
+it was already changed in this transaction
+
+# Staged ref changes become visible only at commit, including to AT (VERSION => ...) in the same transaction
+statement ok
+BEGIN;
+
+statement ok
+select * from iceberg_create_branch('my_datalake.default.manage_refs', 'pending');
+
+statement error
+select count(*) from my_datalake.default.manage_refs AT (VERSION => 'pending');
+----
+Iceberg ref 'pending' does not exist
+
+statement ok
+ROLLBACK;
+
+statement ok
+BEGIN;
+
+statement ok
+select * from iceberg_create_branch('my_datalake.default.manage_refs', 'staged');
+
+query I
+select count(*) from iceberg_refs(my_datalake.default.manage_refs) where name = 'staged';
+----
+0
+
+statement ok
+COMMIT;
+
+query I
+select list(id order by id) from my_datalake.default.manage_refs AT (VERSION => 'staged');
+----
+[1, 2]
+
+statement ok
+select * from iceberg_drop_branch('my_datalake.default.manage_refs', 'staged');
+
+# A ref at "the current snapshot" cannot follow a move of main in the same transaction
+statement ok
+BEGIN;
+
+statement ok
+select * from iceberg_set_current_snapshot('my_datalake.default.manage_refs', getvariable('s1'));
+
+statement error
+select * from iceberg_create_branch('my_datalake.default.manage_refs', 'after_move');
+----
+main was already changed in this transaction; pass snapshot_id
+
+statement ok
+ROLLBACK;
 
 # Dropping main, an unknown ref, or a ref of the other kind is refused
 statement error

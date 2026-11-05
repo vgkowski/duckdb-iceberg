@@ -73,9 +73,15 @@ optional_ptr<IcebergTableSchemaVersion> BindIcebergTable(ClientContext &context,
 	if (input.inputs[0].IsNull()) {
 		throw InvalidInputException("%s: table_name cannot be NULL", function_name);
 	}
+	if (!input.binder) {
+		//! Without a binder the modification cannot be registered, which would bypass read-only and
+		//! transaction checks, so refuse instead.
+		throw InvalidInputException("%s can only be called from a query", function_name);
+	}
 	auto input_string = input.inputs[0].ToString();
 	auto qualified_name = QualifiedName::ParseComponents(input_string);
-	if (qualified_name.size() == 1) {
+	//! Only probe local paths: a URL ('s3://...') would make a network request for what is a table name.
+	if (qualified_name.size() == 1 && input_string.find("://") == string::npos) {
 		auto &fs = FileSystem::GetFileSystem(context);
 		if (fs.DirectoryExists(input_string) || fs.FileExists(input_string)) {
 			throw InvalidInputException("Cannot call %s() on a file/directory", function_name);
@@ -86,11 +92,9 @@ optional_ptr<IcebergTableSchemaVersion> BindIcebergTable(ClientContext &context,
 	if (catalog_entry.catalog.GetCatalogType() != "iceberg" || entry->type != CatalogType::TABLE_ENTRY) {
 		throw InvalidInputException("Cannot call %s on non-iceberg table", function_name);
 	}
-	if (input.binder) {
-		DatabaseModificationType modification;
-		modification |= DatabaseModificationType::ALTER_TABLE;
-		input.binder->GetStatementProperties().RegisterDBModify(entry->ParentCatalog(), context, modification);
-	}
+	DatabaseModificationType modification;
+	modification |= DatabaseModificationType::ALTER_TABLE;
+	input.binder->GetStatementProperties().RegisterDBModify(entry->ParentCatalog(), context, modification);
 	return entry->Cast<IcebergTableSchemaVersion>();
 }
 
@@ -103,6 +107,22 @@ string GetRefNameArgument(const Value &value, const char *function_name, const c
 		throw InvalidInputException("%s: %s cannot be empty", function_name, argument);
 	}
 	return result;
+}
+
+//! Snapshot ids are exact integers: refuse fractional or other types instead of silently rounding.
+int64_t GetSnapshotIdValue(const Value &value, const char *function_name, const char *argument) {
+	if (value.IsNull()) {
+		throw InvalidInputException("%s: '%s' cannot be NULL", function_name, argument);
+	}
+	if (!value.type().IsIntegral()) {
+		throw InvalidInputException("%s: '%s' must be an integer, got %s", function_name, argument,
+		                            value.type().ToString());
+	}
+	auto result = value.DefaultTryCastAs(LogicalType::BIGINT, nullptr, true);
+	if (!result || result->IsNull()) {
+		throw InvalidInputException("%s: '%s' is out of range for a snapshot id", function_name, argument);
+	}
+	return result->GetValue<int64_t>();
 }
 
 int64_t GetRetentionValue(const Value &value, const char *function_name, const string &option) {
@@ -123,10 +143,7 @@ void ParseCreateOptions(TableFunctionBindInput &input, IcebergManageRefsBindData
 		auto option = StringUtil::Lower(kv.first.GetIdentifierName());
 		auto &value = kv.second;
 		if (option == "snapshot_id") {
-			if (value.IsNull()) {
-				throw InvalidInputException("%s: 'snapshot_id' cannot be NULL", function_name);
-			}
-			bind_data.snapshot_id = value.DefaultCastAs(LogicalType::BIGINT).GetValue<int64_t>();
+			bind_data.snapshot_id = GetSnapshotIdValue(value, function_name, "snapshot_id");
 		} else if (option == "max_ref_age_ms") {
 			bind_data.retention.max_ref_age_ms = GetRetentionValue(value, function_name, option);
 		} else if (option == "max_snapshot_age_ms" && !is_tag) {
@@ -179,7 +196,7 @@ unique_ptr<FunctionData> BindManageRefs(IcebergRefOperation operation, ClientCon
 		if (target.type().id() == LogicalTypeId::VARCHAR) {
 			result->source_ref = GetRefNameArgument(target, function_name, "ref");
 		} else {
-			result->snapshot_id = target.DefaultCastAs(LogicalType::BIGINT).GetValue<int64_t>();
+			result->snapshot_id = GetSnapshotIdValue(target, function_name, "snapshot_id");
 		}
 		names = {"previous_snapshot_id", "current_snapshot_id"};
 		return_types = {LogicalType::BIGINT, LogicalType::BIGINT};
@@ -310,12 +327,12 @@ vector<TableFunctionSet> IcebergFunctions::GetIcebergManageRefsFunctions() {
 	result.push_back(std::move(fast_forward));
 
 	TableFunctionSet set_current(FunctionName(IcebergRefOperation::SET_CURRENT));
-	for (auto &type : {LogicalType::BIGINT, LogicalType::UBIGINT, LogicalType::VARCHAR}) {
-		set_current.AddFunction(
-		    MakeFunction<IcebergRefOperation::SET_CURRENT>(FunctionSignature()
-		                                                       .AddPositionalOnly("table_name", LogicalType::VARCHAR)
-		                                                       .AddPositionalOnly("snapshot_id_or_ref", type)));
-	}
+	//! ANY so that a fractional argument is refused at bind time instead of being cast (and rounded) to an id;
+	//! integers are snapshot ids and VARCHAR names a ref.
+	set_current.AddFunction(
+	    MakeFunction<IcebergRefOperation::SET_CURRENT>(FunctionSignature()
+	                                                       .AddPositionalOnly("table_name", LogicalType::VARCHAR)
+	                                                       .AddPositionalOnly("snapshot_id_or_ref", LogicalType::ANY)));
 	result.push_back(std::move(set_current));
 	return result;
 }

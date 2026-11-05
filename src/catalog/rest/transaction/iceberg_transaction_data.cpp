@@ -424,6 +424,10 @@ static bool IsAncestorOfCurrentSnapshot(const IcebergTableMetadata &metadata, in
 	if (target_snapshot_id == current_snapshot_id) {
 		return true;
 	}
+	//! Parent ids come from catalog metadata, which may be malformed: a cycle must not loop forever.
+	//! A valid lineage visits each snapshot at most once, so more steps than snapshots means a cycle.
+	const idx_t max_steps = metadata.snapshots.size();
+	idx_t steps = 0;
 	optional_ptr<const IcebergSnapshot> cursor = metadata.FindSnapshotByIdInternal(current_snapshot_id);
 	while (cursor) {
 		if (!cursor->parent_snapshot_id) {
@@ -432,6 +436,11 @@ static bool IsAncestorOfCurrentSnapshot(const IcebergTableMetadata &metadata, in
 		auto parent_id = *cursor->parent_snapshot_id;
 		if (parent_id == target_snapshot_id) {
 			return true;
+		}
+		if (++steps > max_steps) {
+			throw InvalidConfigurationException(
+			    "Iceberg snapshot lineage of snapshot %lld contains a cycle in the table metadata",
+			    current_snapshot_id);
 		}
 		cursor = metadata.FindSnapshotByIdInternal(parent_id);
 	}
@@ -489,21 +498,19 @@ optional<ResolvedRef> FindRef(const IcebergTableMetadata &metadata, const string
 		auto &refs = metadata.refs->additional_properties;
 		auto entry = refs.find(ref_name);
 		if (entry != refs.end()) {
-			if (entry->first != ref_name) {
-				//! The parsed refs map is case-insensitive, but Iceberg ref names are not.
-				throw InvalidInputException(
-				    "Iceberg ref '%s' does not exist (ref names are case-sensitive; found '%s')", ref_name,
-				    entry->first);
-			}
-			auto type = StringUtil::Lower(entry->second.type);
+			//! The same exact type match as reads (IcebergTableMetadata::GetSnapshotByRef).
+			auto &type = entry->second.type;
 			ResolvedRef result;
 			if (type == "branch") {
 				result.type = IcebergRefType::BRANCH;
 			} else if (type == "tag") {
 				result.type = IcebergRefType::TAG;
 			} else {
-				throw InvalidConfigurationException("Iceberg ref '%s' has unknown type '%s'", ref_name,
-				                                    entry->second.type);
+				//! The type comes from metadata, so keep the message bounded
+				static constexpr idx_t MAX_TYPE_LENGTH = 64;
+				auto shown_type = type.size() > MAX_TYPE_LENGTH ? type.substr(0, MAX_TYPE_LENGTH) + "..." : type;
+				throw InvalidConfigurationException(
+				    "Iceberg ref '%s' has unknown type '%s', expected 'branch' or 'tag'", ref_name, shown_type);
 			}
 			result.snapshot_id = entry->second.snapshot_id;
 			return result;
@@ -534,21 +541,23 @@ void IcebergTransactionData::ValidateNewRefName(const string &ref_name) {
 	if (ref_name.size() > MAX_REF_NAME_LENGTH) {
 		throw InvalidInputException("Iceberg ref name is longer than %llu bytes", MAX_REF_NAME_LENGTH);
 	}
-	bool all_digits = true;
 	for (auto c : ref_name) {
 		auto byte = static_cast<unsigned char>(c);
 		if (byte < 0x20 || byte == 0x7f) {
 			throw InvalidInputException("Iceberg ref name cannot contain control characters");
 		}
-		if (!StringUtil::CharacterIsDigit(c)) {
-			all_digits = false;
-		}
 	}
 	if (StringUtil::CharacterIsSpace(ref_name.front()) || StringUtil::CharacterIsSpace(ref_name.back())) {
 		throw InvalidInputException("Iceberg ref name '%s' cannot start or end with whitespace", ref_name);
 	}
+	//! AT (VERSION => '<digits>') reads a snapshot id (an optional sign then digits, like Long.parseLong),
+	//! so such a ref could not be read by name. Refuse every such name, including ones out of int64 range.
+	idx_t first_digit = (ref_name[0] == '+' || ref_name[0] == '-') ? 1 : 0;
+	bool all_digits = first_digit < ref_name.size();
+	for (idx_t i = first_digit; i < ref_name.size() && all_digits; i++) {
+		all_digits = StringUtil::CharacterIsDigit(ref_name[i]);
+	}
 	if (all_digits) {
-		//! AT (VERSION => '<digits>') reads a snapshot id, so such a ref could never be read by name.
 		throw InvalidInputException("Iceberg ref name '%s' cannot consist only of digits", ref_name);
 	}
 }
@@ -588,12 +597,21 @@ int64_t IcebergTransactionData::TableCreateRef(const string &ref_name, IcebergRe
 		}
 		target_snapshot_id = *snapshot_id;
 	} else {
+		if (modified_refs.count("main")) {
+			//! main would be read at its pre-transaction snapshot, not where this transaction moves it.
+			throw InvalidInputException("Cannot create %s '%s' at the current snapshot of table \"%s\": main was "
+			                            "already changed in this transaction; pass snapshot_id",
+			                            RefTypeName(ref_type), ref_name, table_info.name);
+		}
 		auto main = FindRef(metadata, "main");
 		if (!main) {
 			throw InvalidInputException("Cannot create %s '%s': table \"%s\" has no current snapshot",
 			                            RefTypeName(ref_type), ref_name, table_info.name);
 		}
 		target_snapshot_id = main->snapshot_id;
+		//! The ref is created at the snapshot main had when it was read: a concurrent move of main
+		//! aborts the commit instead of silently tagging a snapshot the caller never saw.
+		requirements.push_back(make_uniq<AssertRefSnapshotId>("main", target_snapshot_id));
 	}
 
 	//! A null snapshot id requires that the ref does not exist when the catalog applies the commit.
@@ -644,7 +662,9 @@ IcebergRefMove IcebergTransactionData::TableFastForward(const string &branch, co
 	result.previous_snapshot_id = branch_ref.snapshot_id;
 	result.updated_snapshot_id = target_ref.snapshot_id;
 	if (branch_ref.snapshot_id == target_ref.snapshot_id) {
-		//! Nothing to publish.
+		//! Nothing to publish, but the result reported where the branch is: a later change of it in this
+		//! transaction would contradict that, so it counts as changed.
+		modified_refs.insert(branch);
 		return result;
 	}
 	if (!metadata.FindSnapshotByIdInternal(target_ref.snapshot_id)) {
@@ -698,7 +718,9 @@ IcebergRefMove IcebergTransactionData::TableSetCurrentSnapshot(optional<int64_t>
 		expected_main = main->snapshot_id;
 	}
 	if (main && main->snapshot_id == target_snapshot_id) {
-		//! Nothing to publish.
+		//! Nothing to publish, but a later change of main in this transaction would contradict the
+		//! reported result, so it counts as changed.
+		modified_refs.insert("main");
 		return result;
 	}
 	if (!source_ref.empty() && source_ref != "main") {
