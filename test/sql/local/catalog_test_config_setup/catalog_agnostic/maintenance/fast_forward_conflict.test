@@ -239,5 +239,33 @@ select list(id order by id) from my_datalake.default.fast_forward_conflict AT (V
 ----
 [1, 4, 5, 6]
 
+# 9. A concurrent drop of the same ref aborts the second drop
+statement ok
+select * from iceberg_create_branch('my_datalake.default.fast_forward_conflict', 'dropped_twice');
+
+statement ok con1
+BEGIN;
+
+statement ok con1
+select * from iceberg_drop_branch('my_datalake.default.fast_forward_conflict', 'dropped_twice');
+
+statement ok con2
+select * from iceberg_drop_branch('my_datalake.default.fast_forward_conflict', 'dropped_twice');
+
+statement error con1
+COMMIT;
+----
+<REGEX>:.*Failed to commit Iceberg transaction.*409.*
+
+query I
+select count(*) from iceberg_refs(my_datalake.default.fast_forward_conflict) where name = 'dropped_twice';
+----
+0
+
+query I
+select list(id order by id) from my_datalake.default.fast_forward_conflict;
+----
+[1, 4, 5, 6]
+
 statement ok
 drop table my_datalake.default.fast_forward_conflict;

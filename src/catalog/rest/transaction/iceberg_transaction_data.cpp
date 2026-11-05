@@ -724,6 +724,9 @@ IcebergRefMove IcebergTransactionData::TableSetCurrentSnapshot(optional<int64_t>
 	}
 
 	auto main = FindRef(metadata, "main");
+	if (main && main->type != IcebergRefType::BRANCH) {
+		throw InvalidConfigurationException("Iceberg ref 'main' of table \"%s\" is not a branch", table_info.name);
+	}
 	IcebergRefMove result;
 	result.updated_snapshot_id = target_snapshot_id;
 	optional<int64_t> expected_main;

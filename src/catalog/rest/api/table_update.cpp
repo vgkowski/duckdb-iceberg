@@ -1,5 +1,6 @@
 #include "catalog/rest/api/table_update.hpp"
 #include "duckdb/common/exception.hpp"
+#include "duckdb/common/string_util.hpp"
 #include "catalog/rest/iceberg_table_set.hpp"
 
 namespace duckdb {
@@ -308,6 +309,8 @@ void SetSnapshotRef::CreateUpdate(DatabaseInstance &db, ClientContext &context,
 			if (entry != refs->additional_properties.end()) {
 				// Updating the snapshot ID must preserve the reference's retention policy.
 				snapshot_reference = entry->second.Copy();
+				//! Refs are read case-insensitively, but catalogs expect the spec's lowercase type.
+				snapshot_reference.type = StringUtil::Lower(snapshot_reference.type);
 			}
 		}
 	}
