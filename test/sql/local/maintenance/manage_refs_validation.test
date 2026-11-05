@@ -1,0 +1,48 @@
+# name: test/sql/local/maintenance/manage_refs_validation.test
+# description: bind-time validation for the Iceberg ref management functions
+# group: [maintenance]
+
+include test/sql/init_requires
+
+statement ok
+CREATE TABLE local_table (id INTEGER);
+
+statement error
+SELECT * FROM iceberg_create_branch('local_table', 'audit');
+----
+Cannot call iceberg_create_branch on non-iceberg table
+
+statement error
+SELECT * FROM iceberg_create_tag('local_table', 'v1');
+----
+Cannot call iceberg_create_tag on non-iceberg table
+
+statement error
+SELECT * FROM iceberg_drop_branch('local_table', 'audit');
+----
+Cannot call iceberg_drop_branch on non-iceberg table
+
+statement error
+SELECT * FROM iceberg_drop_tag('local_table', 'v1');
+----
+Cannot call iceberg_drop_tag on non-iceberg table
+
+statement error
+SELECT * FROM iceberg_fast_forward('local_table', 'main', 'audit');
+----
+Cannot call iceberg_fast_forward on non-iceberg table
+
+statement error
+SELECT * FROM iceberg_set_current_snapshot('local_table', 1);
+----
+Cannot call iceberg_set_current_snapshot on non-iceberg table
+
+statement error
+SELECT * FROM iceberg_fast_forward('cat.sch.tbl', 'main', 'audit');
+----
+Catalog "cat" does not exist
+
+statement error
+SELECT * FROM iceberg_create_branch(NULL, 'audit');
+----
+table_name cannot be NULL

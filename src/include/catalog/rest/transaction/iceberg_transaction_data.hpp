@@ -1,6 +1,7 @@
 #pragma once
 
 #include "duckdb/common/optional.hpp"
+#include "duckdb/common/unordered_set.hpp"
 #include "duckdb/main/client_context.hpp"
 #include "duckdb/function/copy_function.hpp"
 
@@ -20,6 +21,14 @@ namespace duckdb {
 struct IcebergTable;
 struct IcebergCreateTableRequest;
 class IcebergMergeDeleteCollector;
+
+enum class IcebergRefType : uint8_t { BRANCH, TAG };
+
+//! Outcome of moving a branch: the snapshot it pointed at, and the one it points at after the commit.
+struct IcebergRefMove {
+	optional<int64_t> previous_snapshot_id;
+	int64_t updated_snapshot_id = 0;
+};
 
 struct IcebergTransactionData {
 public:
@@ -62,8 +71,23 @@ public:
 	void TableSetLocation();
 	//! Roll main back to an ancestor snapshot (Spark rollback_to_snapshot semantics).
 	void TableRollbackToSnapshot(int64_t snapshot_id);
+	//! Create a branch or tag at 'snapshot_id' (default: the current snapshot of main). Returns the snapshot id.
+	int64_t TableCreateRef(const string &ref_name, IcebergRefType ref_type, optional<int64_t> snapshot_id,
+	                       const IcebergSnapshotRefRetention &retention);
+	//! Remove a branch or tag other than main. Returns the snapshot id it pointed at.
+	int64_t TableDropRef(const string &ref_name, IcebergRefType ref_type);
+	//! Spark fast_forward: move 'branch' to the snapshot of 'to' when the branch's snapshot is its ancestor.
+	IcebergRefMove TableFastForward(const string &branch, const string &to);
+	//! Spark set_current_snapshot: point main at a snapshot or at the snapshot of a ref, without ancestry checks.
+	IcebergRefMove TableSetCurrentSnapshot(optional<int64_t> snapshot_id, const string &source_ref);
+
+	//! Validate a user-supplied ref name for a new ref.
+	static void ValidateNewRefName(const string &ref_name);
 
 private:
+	//! Ref changes are validated against the pre-transaction refs, so they cannot follow row changes or
+	//! another change to the same ref.
+	void VerifyCanChangeRef(const string &ref_name) const;
 	void CacheExistingManifestList(lock_guard<mutex> &guard, const IcebergTableMetadata &metadata);
 	//! Retains one pending delete manifest per partition spec present in 'delete_files'.
 	void AddPendingDeleteManifests(IcebergAddSnapshot &add_snapshot, partitioned_manifest_entry_map_t &&delete_files);
@@ -114,6 +138,9 @@ public:
 	bool rolls_back = false;
 	//! A rewrite cannot be combined with other changes to the table's rows.
 	bool rewrites_data_files = false;
+	//! Refs created, moved or removed by this transaction (exact names; main when rolled back).
+	//! Each ref may change once: later validation would otherwise see the pre-transaction state.
+	unordered_set<string> modified_refs;
 	mutable mutex lock;
 };
 

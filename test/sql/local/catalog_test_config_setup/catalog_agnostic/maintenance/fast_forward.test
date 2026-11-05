@@ -1,0 +1,212 @@
+# name: test/sql/local/catalog_test_config_setup/catalog_agnostic/maintenance/fast_forward.test
+# description: iceberg_fast_forward publishes a branch (Spark fast_forward), and iceberg_set_current_snapshot moves main
+# group: [maintenance]
+
+require-env CATALOG_TEST_CONFIG_SETUP
+
+require-env TIMETRAVEL_SUPPORT
+
+include test/sql/init_requires
+
+statement ok
+drop table if exists my_datalake.default.fast_forward;
+
+statement ok
+create table my_datalake.default.fast_forward (id INTEGER);
+
+statement ok
+insert into my_datalake.default.fast_forward values (1);
+
+statement ok
+set variable s1 = (select snapshot_id::BIGINT from iceberg_snapshots(my_datalake.default.fast_forward) order by sequence_number desc limit 1);
+
+statement ok
+insert into my_datalake.default.fast_forward values (2);
+
+statement ok
+set variable s2 = (select snapshot_id::BIGINT from iceberg_snapshots(my_datalake.default.fast_forward) order by sequence_number desc limit 1);
+
+# Stage an audited snapshot on a branch ahead of main: branch at s2, then move main back to s1
+statement ok
+select * from iceberg_create_branch('my_datalake.default.fast_forward', 'audit');
+
+statement ok
+select * from iceberg_create_tag('my_datalake.default.fast_forward', 'audited', snapshot_id := getvariable('s2'));
+
+statement ok
+select * from iceberg_create_tag('my_datalake.default.fast_forward', 'base', snapshot_id := getvariable('s1'));
+
+statement ok
+select * from iceberg_rollback_to_snapshot('my_datalake.default.fast_forward', getvariable('s1'));
+
+query I
+select list(id order by id) from my_datalake.default.fast_forward;
+----
+[1]
+
+query I
+select list(id order by id) from my_datalake.default.fast_forward AT (VERSION => 'audit');
+----
+[1, 2]
+
+# A tag cannot be fast-forwarded, a ref cannot be fast-forwarded to itself, and both refs must exist
+statement error
+select * from iceberg_fast_forward('my_datalake.default.fast_forward', 'base', 'audit');
+----
+Ref 'base' is a tag, not a branch
+
+statement error
+select * from iceberg_fast_forward('my_datalake.default.fast_forward', 'main', 'main');
+----
+Cannot fast-forward branch 'main' to itself
+
+statement error
+select * from iceberg_fast_forward('my_datalake.default.fast_forward', 'missing', 'audit');
+----
+Branch to update 'missing' does not exist
+
+statement error
+select * from iceberg_fast_forward('my_datalake.default.fast_forward', 'main', 'missing');
+----
+Ref 'missing' does not exist
+
+# audit is ahead of main, not behind it
+statement error
+select * from iceberg_fast_forward('my_datalake.default.fast_forward', 'audit', 'main');
+----
+Cannot fast-forward: 'audit' is not an ancestor of 'main'
+
+# Publication cannot be combined with row changes in one transaction
+statement ok
+BEGIN;
+
+statement ok
+select * from iceberg_fast_forward('my_datalake.default.fast_forward', 'main', 'audit');
+
+statement error
+insert into my_datalake.default.fast_forward values (3);
+----
+after changing its refs in the same transaction
+
+statement ok
+ROLLBACK;
+
+statement ok
+BEGIN;
+
+statement ok
+select * from iceberg_fast_forward('my_datalake.default.fast_forward', 'main', 'audit');
+
+statement error
+select * from iceberg_rollback_to_snapshot('my_datalake.default.fast_forward', getvariable('s1'));
+----
+it was already changed in this transaction
+
+statement ok
+ROLLBACK;
+
+query I
+select list(id order by id) from my_datalake.default.fast_forward;
+----
+[1]
+
+# Publish: main moves to the audited snapshot, and the branch stays where it is
+query TTT
+select branch_updated, previous_ref = getvariable('s1'), updated_ref = getvariable('s2') from iceberg_fast_forward('my_datalake.default.fast_forward', 'main', 'audit');
+----
+main	true	true
+
+query I
+select list(id order by id) from my_datalake.default.fast_forward;
+----
+[1, 2]
+
+query TT
+select name, snapshot_id = getvariable('s2') from iceberg_refs(my_datalake.default.fast_forward) where name in ('main', 'audit') order by name;
+----
+audit	true
+main	true
+
+# Already at the target: nothing to publish
+query TTT
+select branch_updated, previous_ref = getvariable('s2'), updated_ref = getvariable('s2') from iceberg_fast_forward('my_datalake.default.fast_forward', 'main', 'audit');
+----
+main	true	true
+
+# A non-main branch can be fast-forwarded too, to a tag
+statement ok
+select * from iceberg_create_branch('my_datalake.default.fast_forward', 'dev', snapshot_id := getvariable('s1'));
+
+query TTT
+select branch_updated, previous_ref = getvariable('s1'), updated_ref = getvariable('s2') from iceberg_fast_forward('my_datalake.default.fast_forward', 'dev', 'audited');
+----
+dev	true	true
+
+query I
+select list(id order by id) from my_datalake.default.fast_forward AT (VERSION => 'dev');
+----
+[1, 2]
+
+# Diverged histories: s3 (parent s2) and s4 (parent s1) are siblings descending from s1.
+statement ok
+insert into my_datalake.default.fast_forward values (3);
+
+statement ok
+set variable s3 = (select snapshot_id::BIGINT from iceberg_snapshots(my_datalake.default.fast_forward) order by sequence_number desc limit 1);
+
+statement ok
+select * from iceberg_rollback_to_snapshot('my_datalake.default.fast_forward', getvariable('s1'));
+
+statement ok
+insert into my_datalake.default.fast_forward values (4);
+
+statement ok
+set variable s4 = (select snapshot_id::BIGINT from iceberg_snapshots(my_datalake.default.fast_forward) order by sequence_number desc limit 1);
+
+statement ok
+select * from iceberg_create_tag('my_datalake.default.fast_forward', 'side', snapshot_id := getvariable('s3'));
+
+# main (s4, parent s1) is not an ancestor of side (s3, parent s2): refused, main unchanged
+statement error
+select * from iceberg_fast_forward('my_datalake.default.fast_forward', 'main', 'side');
+----
+Cannot fast-forward: 'main' is not an ancestor of 'side'
+
+query I
+select list(id order by id) from my_datalake.default.fast_forward;
+----
+[1, 4]
+
+# set_current_snapshot publishes without an ancestry check, by ref or by snapshot id
+query TT
+select previous_snapshot_id = getvariable('s4'), current_snapshot_id = getvariable('s3') from iceberg_set_current_snapshot('my_datalake.default.fast_forward', 'side');
+----
+true	true
+
+query I
+select list(id order by id) from my_datalake.default.fast_forward;
+----
+[1, 2, 3]
+
+query TT
+select previous_snapshot_id = getvariable('s3'), current_snapshot_id = getvariable('s4') from iceberg_set_current_snapshot('my_datalake.default.fast_forward', getvariable('s4'));
+----
+true	true
+
+query I
+select list(id order by id) from my_datalake.default.fast_forward;
+----
+[1, 4]
+
+statement error
+select * from iceberg_set_current_snapshot('my_datalake.default.fast_forward', 42);
+----
+unknown snapshot id: 42
+
+statement error
+select * from iceberg_set_current_snapshot('my_datalake.default.fast_forward', 'missing');
+----
+Ref 'missing' does not exist
+
+statement ok
+drop table my_datalake.default.fast_forward;

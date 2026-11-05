@@ -434,9 +434,15 @@ class Catalog:
             identifier = update["snapshot-id"]
             if not any(s["snapshot-id"] == identifier for s in metadata["snapshots"]):
                 invalid("Unknown snapshot reference")
-            if update["ref-name"] != "main" or update["type"] != "branch":
-                unsupported("Only the main branch is implemented")
-            metadata["refs"]["main"] = {k: v for k, v in update.items() if k not in ("action", "ref-name")}
+            ref_name = update["ref-name"]
+            if not isinstance(ref_name, str) or not ref_name or update["type"] not in ("branch", "tag"):
+                invalid("Invalid snapshot reference")
+            if ref_name == "main" and update["type"] != "branch":
+                invalid("The main ref must be a branch")
+            metadata["refs"][ref_name] = {k: v for k, v in update.items() if k not in ("action", "ref-name")}
+            if ref_name != "main":
+                # Only main determines the current snapshot and its history.
+                return
             if metadata.get("current-snapshot-id") != identifier:
                 # New snapshots are addressable at their own timestamps. Moving main
                 # back to an existing snapshot is a new history event, not a rewrite
@@ -446,5 +452,12 @@ class Catalog:
                     timestamp = next(s["timestamp-ms"] for s in metadata["snapshots"] if s["snapshot-id"] == identifier)
                 metadata["snapshot-log"].append({"snapshot-id": identifier, "timestamp-ms": timestamp})
                 metadata["current-snapshot-id"] = identifier
+        elif action == "remove-snapshot-ref":
+            ref_name = update["ref-name"]
+            if ref_name == "main":
+                unsupported("Removing the main branch is not implemented")
+            if ref_name not in metadata["refs"]:
+                invalid("Unknown snapshot reference")
+            del metadata["refs"][ref_name]
         else:
             invalid(f"Unknown update action: {action}")
