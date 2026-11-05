@@ -543,9 +543,13 @@ void Catalog::Apply(Json &metadata, const Json &update, map<string, int64_t> &la
 			}
 		}
 		if (snapshot.At("sequence-number").Integer() <= metadata.At("last-sequence-number").Integer()) {
-			//! A stale sequence number (e.g. after a commit to another branch) is retryable, as Iceberg's
-			//! CatalogHandlers report its RetryableValidationException as a CommitFailedException
-			throw CatalogError(409, "CommitFailedException", "Snapshot sequence number must increase");
+			//! As Iceberg's TableMetadata builder (iceberg-rest-fixture 1.10.1 answers this with a 400
+			//! ValidationException), also when a commit to another branch advanced last-sequence-number
+			throw CatalogError(400, "ValidationException",
+			                   "Cannot add snapshot with sequence number " +
+			                       std::to_string(snapshot.At("sequence-number").Integer()) +
+			                       " older than last sequence number " +
+			                       std::to_string(metadata.At("last-sequence-number").Integer()));
 		}
 		if (!snapshot.Get("parent-snapshot-id").IsNull()) {
 			FindID(metadata.At("snapshots"), "snapshot-id", snapshot.At("parent-snapshot-id").Integer());
@@ -609,6 +613,15 @@ void Catalog::Apply(Json &metadata, const Json &update, map<string, int64_t> &la
 			metadata.At("snapshot-log").Push(Json::Object({{"snapshot-id", identifier}, {"timestamp-ms", timestamp}}));
 			metadata["current-snapshot-id"] = identifier;
 		}
+	} else if (action == "remove-snapshot-ref") {
+		auto ref_name = update.At("ref-name").String();
+		if (ref_name == "main") {
+			Unsupported("Removing main is not implemented");
+		}
+		if (!metadata.At("refs").Has(ref_name)) {
+			Invalid("Unknown ref: " + ref_name);
+		}
+		metadata.At("refs").Erase(ref_name);
 	} else {
 		Invalid("Unknown update action: " + action);
 	}

@@ -23,19 +23,40 @@ void ValidateIcebergBranchName(const string &branch) {
 		throw InvalidInputException("'%s' must not start or end with whitespace, got '%s'", WAP_BRANCH_CONFIG_VARIABLE,
 		                            branch);
 	}
-	//! AT (VERSION => '<n>') reads a numeric string as a snapshot id, so such a branch could not be read back by name
-	if (Value(branch).DefaultTryCastAs(LogicalType::BIGINT, nullptr, true)) {
+	//! AT (VERSION => '<n>') reads a numeric string as a snapshot id, so such a branch could not be read back by name.
+	//! Same rule as IcebergSnapshotLookup::FromVersion.
+	int64_t snapshot_id;
+	if (IcebergSnapshotLookup::TryParseSnapshotId(branch, snapshot_id)) {
 		throw InvalidInputException("'%s' must not be a number, since a numeric VERSION names a snapshot id, got '%s'",
 		                            WAP_BRANCH_CONFIG_VARIABLE, branch);
 	}
+	//! Ref names are case-sensitive, so 'Main' would be a separate branch that is easily mistaken for main
+	if (branch != ICEBERG_MAIN_BRANCH && StringUtil::CIEquals(branch, ICEBERG_MAIN_BRANCH)) {
+		throw InvalidInputException("'%s' must be exactly 'main' to target main, got '%s'", WAP_BRANCH_CONFIG_VARIABLE,
+		                            branch);
+	}
+}
+
+bool GetIcebergWapBranchCreateMissing(ClientContext &context) {
+	Value value;
+	if (!context.TryGetCurrentSetting(WAP_BRANCH_CREATE_MISSING_CONFIG_VARIABLE, value) || value.IsNull()) {
+		return true;
+	}
+	return BooleanValue::Get(value.DefaultCastAs(LogicalType::BOOLEAN));
 }
 
 string GetIcebergWapBranch(ClientContext &context) {
 	Value value;
-	if (!context.TryGetCurrentSetting(WAP_BRANCH_CONFIG_VARIABLE, value) || value.IsNull()) {
+	auto lookup = context.TryGetCurrentSetting(WAP_BRANCH_CONFIG_VARIABLE, value);
+	if (!lookup || value.IsNull()) {
 		return ICEBERG_MAIN_BRANCH;
 	}
 	auto branch = StringValue::Get(value);
+	if (lookup.GetScope() == SettingScope::GLOBAL && !branch.empty()) {
+		//! SET GLOBAL is refused; a value configured globally by other means must not redirect every session
+		throw InvalidConfigurationException("'%s' can only be set for the session, not globally",
+		                                    WAP_BRANCH_CONFIG_VARIABLE);
+	}
 	//! The setter validates too; re-check so a value set through another path can not slip through
 	ValidateIcebergBranchName(branch);
 	if (branch.empty()) {

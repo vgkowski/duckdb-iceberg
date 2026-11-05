@@ -116,18 +116,15 @@ static unique_ptr<FunctionData> IcebergScanPlanBind(ClientContext &context, Tabl
 		IcebergSnapshotScanInfo snapshot;
 		if (options.snapshot_lookup->IsLatest()) {
 			//! Plan what a plain read of the table sees: the session's WAP branch, or main
-			auto wap_branch = GetIcebergWapBranch(context);
-			if (table_entry->table_info.transaction_data) {
-				table_entry->table_info.transaction_data->VerifyTargetBranch(wap_branch);
-			}
-			snapshot = metadata.GetBranchReadSnapshot(wap_branch);
+			snapshot = GetWapReadSnapshot(context, metadata, table_entry->table_info.transaction_data.get());
 		} else {
 			snapshot = metadata.GetSnapshot(*options.snapshot_lookup);
 		}
 		auto &schema = metadata.GetSchemaFromId(snapshot.schema_id);
 		auto &fs = FileSystem::GetFileSystem(context);
 		scan_info = make_shared_ptr<IcebergScanInfo>(metadata.GetMetadataPath(fs), metadata, snapshot, schema);
-		if (snapshot.is_transaction_head && table_entry->table_info.transaction_data) {
+		if (table_entry->table_info.transaction_data &&
+		    table_entry->table_info.transaction_data->IsVisibleIn(snapshot)) {
 			scan_info->transaction_data = table_entry->table_info.transaction_data.get();
 		}
 	} else {

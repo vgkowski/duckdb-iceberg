@@ -43,7 +43,7 @@ static unique_ptr<FunctionData> IcebergManifestsBind(ClientContext &context, Tab
 	auto resolved_metadata = IcebergUtils::ResolveTableMetadata(context, input_string, options);
 
 	bind_data->metadata = std::move(resolved_metadata.metadata);
-	auto snapshot_to_scan = bind_data->metadata.GetSnapshot(*options.snapshot_lookup);
+	auto snapshot_to_scan = resolved_metadata.GetSnapshot(bind_data->metadata, *options.snapshot_lookup);
 	if (snapshot_to_scan.snapshot) {
 		bind_data->manifest_list = IcebergManifestList::Load(resolved_metadata.table_location, bind_data->metadata,
 		                                                     snapshot_to_scan, context, options);

@@ -33,14 +33,14 @@ INSERT INTO my_datalake.default.wap VALUES (1, 'a'), (2, 'b');
 statement ok
 SET VARIABLE main_snapshot = (SELECT snapshot_id FROM iceberg_refs(my_datalake.default.wap) WHERE name = 'main');
 
-# A branch that does not exist yet reads as main, as Spark's spark.wap.branch
+# A branch that does not exist yet is not read as main (unlike Spark), so an audit never sees main by mistake
 statement ok
 SET iceberg_wap_branch = 'audit';
 
-query I
+statement error
 SELECT count(*) FROM my_datalake.default.wap;
 ----
-2
+does not exist in this table, and reads do not fall back to main
 
 # The first commit creates the branch from main's current snapshot
 statement ok

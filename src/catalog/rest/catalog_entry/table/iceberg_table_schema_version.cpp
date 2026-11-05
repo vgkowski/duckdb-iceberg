@@ -81,11 +81,7 @@ TableFunction IcebergTableSchemaVersion::GetScanFunction(ClientContext &context,
 	IcebergSnapshotScanInfo snapshot_info;
 	if (snapshot_lookup.IsLatest()) {
 		//! Without an AT clause the session's WAP branch is read (main when unset), as Spark with spark.wap.branch
-		auto wap_branch = GetIcebergWapBranch(context);
-		if (table_info.transaction_data) {
-			table_info.transaction_data->VerifyTargetBranch(wap_branch);
-		}
-		snapshot_info = metadata.GetBranchReadSnapshot(wap_branch);
+		snapshot_info = GetWapReadSnapshot(context, metadata, table_info.transaction_data.get());
 	} else {
 		snapshot_info = metadata.GetSnapshot(snapshot_lookup);
 	}
@@ -99,7 +95,7 @@ TableFunction IcebergTableSchemaVersion::GetScanFunction(ClientContext &context,
 	auto &transaction = IcebergTransaction::Get(context, catalog);
 	scan_info->serialization_transaction_id = transaction.scan_serialization_id;
 	scan_info->serialization_query_id = transaction.active_query.load();
-	if (table_info.transaction_data && snapshot_info.is_transaction_head) {
+	if (table_info.transaction_data && table_info.transaction_data->IsVisibleIn(snapshot_info)) {
 		scan_info->transaction_data = table_info.transaction_data.get();
 	}
 

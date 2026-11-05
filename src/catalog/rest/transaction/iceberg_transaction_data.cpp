@@ -195,6 +195,17 @@ bool IcebergTransactionData::RetryStateMatches(const IcebergTable &table) const 
 	return true;
 }
 
+IcebergSnapshotScanInfo GetWapReadSnapshot(ClientContext &context, const IcebergTableMetadata &metadata,
+                                           optional_ptr<const IcebergTransactionData> transaction_data) {
+	auto wap_branch = GetIcebergWapBranch(context);
+	bool pending_creation = false;
+	if (transaction_data) {
+		transaction_data->VerifyTargetBranch(wap_branch);
+		pending_creation = transaction_data->CreatesBranch(wap_branch);
+	}
+	return metadata.GetBranchReadSnapshot(wap_branch, pending_creation);
+}
+
 const string &IcebergTransactionData::GetTargetBranch() const {
 	return target_branch;
 }
@@ -222,10 +233,41 @@ void IcebergTransactionData::BindTargetBranch(lock_guard<mutex> &guard) {
 			                              table_info.name, session_branch);
 		}
 		//! Throws now, rather than at commit, if the ref is a tag
-		table_info.table_metadata.GetBranchHead(session_branch);
+		auto head = table_info.table_metadata.GetBranchHead(session_branch);
+		target_branch_existed = head.ref_snapshot != nullptr;
+		may_create_branch = GetIcebergWapBranchCreateMissing(context);
+		if (!target_branch_existed && !may_create_branch) {
+			throw InvalidInputException("Iceberg branch '%s' does not exist in table \"%s\", and '%s' is false",
+			                            session_branch, table_info.name, WAP_BRANCH_CREATE_MISSING_CONFIG_VARIABLE);
+		}
 	}
 	target_branch = std::move(session_branch);
 	target_branch_bound = true;
+}
+
+bool IcebergTransactionData::IsVisibleIn(const IcebergSnapshotScanInfo &snapshot) const {
+	//! Before the first data-changing statement the target is "main", and nothing is staged for a branch
+	return snapshot.is_transaction_head && snapshot.head_branch == target_branch;
+}
+
+bool IcebergTransactionData::CreatesBranch(const string &branch) const {
+	return target_branch_bound && !target_branch_existed && target_branch == branch && !alters.empty();
+}
+
+void IcebergTransactionData::VerifyCommitBranch(const IcebergBranchHead &branch_head) const {
+	if (branch_head.IsMain() || branch_head.ref_snapshot || alters.empty()) {
+		return;
+	}
+	if (target_branch_existed) {
+		//! Recreating it from main would rebase this transaction's changes onto main's lineage
+		throw TransactionException("Iceberg branch '%s' of table \"%s\" was removed concurrently; the changes made "
+		                           "on it in this transaction are not committed",
+		                           branch_head.branch, table_info.name);
+	}
+	if (!may_create_branch) {
+		throw InvalidInputException("Iceberg branch '%s' does not exist in table \"%s\", and '%s' is false",
+		                            branch_head.branch, table_info.name, WAP_BRANCH_CREATE_MISSING_CONFIG_VARIABLE);
+	}
 }
 
 void IcebergTransactionData::CacheExistingManifestList(lock_guard<mutex> &guard, const IcebergTableMetadata &metadata) {
@@ -477,6 +519,14 @@ static bool IsAncestorOfCurrentSnapshot(const IcebergTableMetadata &metadata, in
 }
 
 void IcebergTransactionData::TableRollbackToSnapshot(int64_t snapshot_id) {
+	//! The rollback moves main; refuse while the session targets another branch rather than surprise a WAP user
+	auto session_branch = GetIcebergWapBranch(context);
+	if (session_branch != ICEBERG_MAIN_BRANCH) {
+		throw NotImplementedException("Cannot roll back table \"%s\" while '%s' is set to '%s': rollback moves main. "
+		                              "RESET %s to roll main back",
+		                              table_info.name, WAP_BRANCH_CONFIG_VARIABLE, session_branch,
+		                              WAP_BRANCH_CONFIG_VARIABLE);
+	}
 	//! The commit points main at the last snapshot the transaction adds, which would undo the rollback
 	if (!alters.empty() || rolls_back) {
 		throw InvalidInputException("Cannot roll back table \"%s\": it was already changed in this transaction",

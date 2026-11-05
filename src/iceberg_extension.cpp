@@ -46,6 +46,11 @@ static void SetDefaultFormatVersion(ClientContext &context, SetScope scope, Valu
 }
 
 static void SetWapBranch(ClientContext &context, SetScope scope, Value &parameter) {
+	//! Like spark.wap.branch, a session setting: a global value would silently redirect every other session's writes
+	if (scope == SetScope::GLOBAL) {
+		throw InvalidInputException("'%s' can only be set for the session, not with SET GLOBAL",
+		                            WAP_BRANCH_CONFIG_VARIABLE);
+	}
 	if (parameter.IsNull()) {
 		return;
 	}
@@ -141,8 +146,13 @@ static void LoadInternal(ExtensionLoader &loader) {
 	    WAP_BRANCH_CONFIG_VARIABLE,
 	    "Write-Audit-Publish branch, as Spark's spark.wap.branch. When set, INSERT, DELETE, UPDATE and MERGE on "
 	    "Iceberg catalog tables commit to this branch without moving main (a missing branch is created from main's "
-	    "current snapshot), and reads without an AT clause read the branch. Empty or 'main' targets main.",
-	    LogicalType::VARCHAR, Value(""), SetWapBranch);
+	    "current snapshot unless iceberg_wap_branch_create_missing is false), and reads without an AT clause read the "
+	    "branch (an error if it does not exist). Empty or 'main' targets main. Session only.",
+	    LogicalType::VARCHAR, Value(""), SetWapBranch, SetScope::SESSION);
+	config.AddExtensionOption(WAP_BRANCH_CREATE_MISSING_CONFIG_VARIABLE,
+	                          "Whether a write under iceberg_wap_branch creates a missing branch from main's current "
+	                          "snapshot (as Spark does). Set to false to make writes to a missing branch fail.",
+	                          LogicalType::BOOLEAN, Value::BOOLEAN(true), nullptr, SetScope::SESSION);
 	config.AddExtensionOption("iceberg_use_server_side_scan_planning",
 	                          "Whether or not to use server-side scanning planning (if available)",
 	                          LogicalType::BOOLEAN, Value::BOOLEAN(false), nullptr, SetScope::GLOBAL);

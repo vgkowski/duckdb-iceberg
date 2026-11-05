@@ -66,7 +66,7 @@ static unique_ptr<FunctionData> IcebergColumnStatsBind(ClientContext &context, T
 	auto resolved_metadata = IcebergUtils::ResolveTableMetadata(context, input_string, options);
 	ret->metadata = std::move(resolved_metadata.metadata);
 
-	ret->snapshot_to_scan = ret->metadata.GetSnapshot(*options.snapshot_lookup);
+	ret->snapshot_to_scan = resolved_metadata.GetSnapshot(ret->metadata, *options.snapshot_lookup);
 
 	if (ret->snapshot_to_scan.snapshot) {
 		ret->iceberg_table = IcebergManifestList::Load(resolved_metadata.table_location, ret->metadata,

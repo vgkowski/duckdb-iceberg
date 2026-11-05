@@ -55,6 +55,11 @@ void ValidateIcebergBranchName(const string &branch);
 //! The validated iceberg_wap_branch of this session; "main" when the setting is unset
 string GetIcebergWapBranch(ClientContext &context);
 
+// Whether a write under iceberg_wap_branch may create a missing branch from main (as Spark does). Set to false so a
+// mistyped branch name fails instead of creating a new branch.
+static constexpr const char *WAP_BRANCH_CREATE_MISSING_CONFIG_VARIABLE = "iceberg_wap_branch_create_missing";
+bool GetIcebergWapBranchCreateMissing(ClientContext &context);
+
 static constexpr const char *UNSAFE_STRUCT_NULL_DEFAULT_INTERP_CONFIG_VARIABLE =
     "__iceberg_unsafe_struct_null_default_interp";
 

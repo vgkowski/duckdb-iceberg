@@ -34,17 +34,42 @@ SELECT snapshot_id FROM iceberg_refs(cat.db.events) WHERE name = 'audit';
 RESET iceberg_wap_branch;
 ```
 
-- A branch that does not exist yet reads as main, and the first commit creates it
-  from main's current snapshot, as Spark's WAP writes do.
+- Reading a branch that does not exist is an error; unlike Spark, it never falls back
+  to main, so an audit can not silently look at main's data. A write creates a missing
+  branch from main's current snapshot, as Spark's WAP writes do, and the same
+  transaction then reads its pending state. Since DELETE, UPDATE and MERGE read the
+  branch first, only INSERT creates one. `SET iceberg_wap_branch_create_missing = false`
+  makes writes to a missing branch fail too, so a mistyped name can not create a branch.
+  A commit never recreates a branch that was removed while the transaction ran.
+- Commits to different branches of one table (main included) race on the table-wide
+  sequence number: Iceberg catalogs reject the slower commit with HTTP 400
+  `ValidationException` ("Cannot add snapshot with sequence number ..."), checked with
+  iceberg-rest-fixture 1.10.1. That rejection commits nothing, so appends, and DELETEs
+  allowed to retry, are re-staged on refreshed metadata, but only when the refresh shows
+  another commit advanced the table's last sequence number; otherwise the error is
+  reported. A retried DELETE is re-applied only if its branch still descends from the
+  snapshot it read through appends alone, so a branch reset or recreated meanwhile aborts.
+- Metadata functions (`iceberg_metadata`, `iceberg_files`, `iceberg_manifests`,
+  `iceberg_partitions`, `iceberg_column_stats`, `iceberg_partition_stats`),
+  `iceberg_scan` and `iceberg_scan_plan` of a catalog table read the branch too, unless
+  a snapshot option is given.
 - A ref that is a tag is rejected, for writes and reads.
 - Unlike Spark, the table does not need `write.wap.enabled`: the setting is never
-  silently ignored.
+  silently ignored. Like `spark.wap.branch` it is per session: `SET GLOBAL` is refused.
 - The branch is fixed for a table by the first data-changing statement of a
   transaction. A table created in the transaction, and `iceberg_rewrite_data_files`,
-  can not target a branch. `iceberg_rollback_to_snapshot` always rolls back main.
+  can not target a branch. `iceberg_rollback_to_snapshot` moves main, so it is refused
+  while the setting names another branch.
+- Schema, partition spec, sort order and property changes are table-wide in Iceberg:
+  an `ALTER TABLE` in a WAP session changes the table for main and every branch, not
+  just the WAP branch.
 - Empty, `'main'` or `RESET` target main. Names that are numbers (a numeric VERSION
-  is a snapshot id), contain control characters or start or end with whitespace are
-  rejected.
+  is a snapshot id, parsed like Java's `Long.parseLong`), spell `main` with other
+  capitalization (ref names are case-sensitive), contain control characters or start
+  or end with whitespace are rejected.
+- Publishing (moving main to the audited branch head) is not done by this setting. Use
+  `iceberg_fast_forward` (coming with the fast-forward work) or another engine, such as
+  Spark's `CALL system.fast_forward('db.events', 'main', 'audit')`.
 
 ## Development setup
 

@@ -127,7 +127,8 @@ static unique_ptr<FunctionData> IcebergPartitionsBind(ClientContext &context, Ta
 	auto resolved_metadata = IcebergUtils::ResolveTableMetadata(context, input_string, bind_data->options);
 	bind_data->table_location = std::move(resolved_metadata.table_location);
 	bind_data->metadata = std::move(resolved_metadata.metadata);
-	bind_data->snapshot_to_scan = bind_data->metadata.GetSnapshot(*bind_data->options.snapshot_lookup);
+	bind_data->snapshot_to_scan =
+	    resolved_metadata.GetSnapshot(bind_data->metadata, *bind_data->options.snapshot_lookup);
 	bind_data->partition_fields = IcebergPartitionStruct::GetFields(bind_data->metadata);
 
 	//! Unpartitioned tables have no 'partition' and 'spec_id', as Iceberg does

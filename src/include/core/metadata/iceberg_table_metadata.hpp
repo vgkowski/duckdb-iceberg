@@ -110,8 +110,9 @@ public:
 	//! missing from 'refs' starts at main's current snapshot (as Iceberg's SnapshotUtil.latestSnapshot); a tag throws.
 	IcebergBranchHead GetBranchHead(const string &branch) const;
 	//! What a read without an AT clause sees while 'branch' is the session's WAP branch: the branch head, read with
-	//! the table's current schema (Iceberg spec: branches use the current schema)
-	IcebergSnapshotScanInfo GetBranchReadSnapshot(const string &branch) const;
+	//! the table's current schema (Iceberg spec: branches use the current schema). A missing branch throws, never
+	//! falling back to main, unless 'branch_pending_creation' (this transaction's writes create it from main).
+	IcebergSnapshotScanInfo GetBranchReadSnapshot(const string &branch, bool branch_pending_creation) const;
 
 	//! Version extraction and identification
 	static bool UnsafeVersionGuessingEnabled(ClientContext &context);

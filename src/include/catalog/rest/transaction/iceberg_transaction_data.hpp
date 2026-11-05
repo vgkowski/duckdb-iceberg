@@ -21,6 +21,14 @@ struct IcebergTable;
 struct IcebergCreateTableRequest;
 class IcebergMergeDeleteCollector;
 
+struct IcebergTransactionData;
+
+//! The snapshot a read of a catalog table without an AT clause (or snapshot option) sees: the head of the session's
+//! iceberg_wap_branch, main when unset. Throws if 'transaction_data' targets another branch, or if the branch does
+//! not exist and this transaction is not creating it (a read never falls back to main).
+IcebergSnapshotScanInfo GetWapReadSnapshot(ClientContext &context, const IcebergTableMetadata &metadata,
+                                           optional_ptr<const IcebergTransactionData> transaction_data);
+
 struct IcebergTransactionData {
 public:
 	IcebergTransactionData(ClientContext &context, IcebergTransaction &transaction, const IcebergTable &table_info);
@@ -68,6 +76,14 @@ public:
 	//! Throws if this transaction's snapshots target another branch than the session's iceberg_wap_branch, so a scan
 	//! never mixes the transaction's pending changes with another branch's state
 	void VerifyTargetBranch(const string &session_branch) const;
+	//! Whether a scan of 'snapshot' must include this transaction's pending changes: only for the head of the
+	//! branch they target, so a read of main never sees changes staged for a WAP branch and vice versa
+	bool IsVisibleIn(const IcebergSnapshotScanInfo &snapshot) const;
+	//! Whether this transaction's changes create 'branch' (it was missing when the first change was staged)
+	bool CreatesBranch(const string &branch) const;
+	//! Throws if the commit may not land on 'branch_head': the target branch was deleted (or is missing while
+	//! creating branches is disabled). Checked on every attempt, so a retry never recreates a deleted branch.
+	void VerifyCommitBranch(const IcebergBranchHead &branch_head) const;
 
 private:
 	//! Fix the target branch from iceberg_wap_branch on the first data-changing statement; later ones must agree.
@@ -126,6 +142,10 @@ public:
 	//! Branch the snapshots commit to, see GetTargetBranch
 	string target_branch = "main";
 	bool target_branch_bound = false;
+	//! Whether the target branch existed when it was bound; if so a commit never recreates it from main
+	bool target_branch_existed = true;
+	//! iceberg_wap_branch_create_missing when the target branch was bound
+	bool may_create_branch = true;
 	mutable mutex lock;
 };
 

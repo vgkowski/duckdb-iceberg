@@ -13,7 +13,9 @@
 
 #include "catalog/rest/catalog_entry/table/iceberg_table_schema_version.hpp"
 #include "catalog/rest/catalog_entry/table/iceberg_table.hpp"
+#include "catalog/rest/transaction/iceberg_transaction_data.hpp"
 #include "core/metadata/iceberg_table_metadata.hpp"
+#include "iceberg_options.hpp"
 #include "duckdb/catalog/catalog_entry_retriever.hpp"
 
 namespace duckdb {
@@ -268,6 +270,14 @@ string IcebergUtils::GetStorageLocation(ClientContext &context, const string &in
 	return storage_location;
 }
 
+IcebergSnapshotScanInfo IcebergResolvedMetadata::GetSnapshot(const IcebergTableMetadata &metadata_p,
+                                                             const IcebergSnapshotLookup &lookup) const {
+	if (wap_branch && lookup.IsLatest()) {
+		return metadata_p.GetBranchReadSnapshot(*wap_branch, wap_branch_pending_creation);
+	}
+	return metadata_p.GetSnapshot(lookup);
+}
+
 IcebergResolvedMetadata IcebergUtils::ResolveTableMetadata(ClientContext &context, const string &input,
                                                            const IcebergOptions &options) {
 	{
@@ -281,7 +291,16 @@ IcebergResolvedMetadata IcebergUtils::ResolveTableMetadata(ClientContext &contex
 			auto &iceberg_table = catalog_entry->Cast<IcebergTableSchemaVersion>();
 			iceberg_table.PrepareIcebergScanFromEntry(context);
 			auto &metadata = iceberg_table.table_info.table_metadata;
-			return IcebergResolvedMetadata(metadata.GetLocation(), metadata.Copy());
+			IcebergResolvedMetadata resolved(metadata.GetLocation(), metadata.Copy());
+			//! Metadata functions and iceberg_scan of a catalog table see what a plain read sees
+			auto wap_branch = GetIcebergWapBranch(context);
+			auto &transaction_data = iceberg_table.table_info.transaction_data;
+			if (transaction_data) {
+				transaction_data->VerifyTargetBranch(wap_branch);
+				resolved.wap_branch_pending_creation = transaction_data->CreatesBranch(wap_branch);
+			}
+			resolved.wap_branch = std::move(wap_branch);
+			return resolved;
 		}
 	}
 

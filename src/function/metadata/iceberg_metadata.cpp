@@ -102,7 +102,7 @@ static unique_ptr<FunctionData> IcebergMetaDataBind(ClientContext &context, Tabl
 	auto input_string = input.inputs[0].ToString();
 	auto resolved_metadata = IcebergUtils::ResolveTableMetadata(context, input_string, options);
 
-	auto snapshot_to_scan = resolved_metadata.metadata.GetSnapshot(*options.snapshot_lookup);
+	auto snapshot_to_scan = resolved_metadata.GetSnapshot(resolved_metadata.metadata, *options.snapshot_lookup);
 
 	if (snapshot_to_scan.snapshot) {
 		ret->iceberg_table = IcebergManifestList::Load(resolved_metadata.table_location, resolved_metadata.metadata,

@@ -202,39 +202,31 @@ static void CreateTableRequirements(DatabaseInstance &db, ClientContext &context
 	}
 }
 
-//! Safe to re-apply a DELETE on retry only if every commit in (base, tip] was a
-//! pure append; anything else may have removed/rewritten the target data. Ranges
-//! over sequence numbers (parent links aren't populated on read snapshots). A
-//! scan/tip snapshot the catalog doesn't expose (e.g. no history) can't be
-//! proven safe, so it counts as not reappliable.
+//! Safe to re-apply a DELETE on retry only if the target branch's tip descends from the
+//! scanned base and every snapshot on that path, (base, tip], is a pure append; anything
+//! else may have removed/rewritten the target data. Walks parent-snapshot-id from the tip,
+//! so commits to other branches are ignored, and a branch that was reset or recreated (tip
+//! not descending from base) is not reappliable. A snapshot missing from the metadata
+//! (e.g. expired history) can't be proven safe, so it counts as not reappliable.
 static bool DeleteCanReapply(const IcebergTableMetadata &metadata, int64_t base_snapshot_id, int64_t tip_snapshot_id) {
 	if (base_snapshot_id == tip_snapshot_id) {
 		return true;
 	}
-	auto base = metadata.FindSnapshotByIdInternal(base_snapshot_id);
-	auto tip = metadata.FindSnapshotByIdInternal(tip_snapshot_id);
-	if (!base || !tip) {
+	if (!metadata.FindSnapshotByIdInternal(base_snapshot_id)) {
 		return false;
 	}
-	if (!base->sequence_number || !tip->sequence_number) {
-		throw InvalidConfigurationException("Committed snapshot is missing a sequence number");
-	}
-	int64_t base_sequence = *base->sequence_number;
-	int64_t tip_sequence = *tip->sequence_number;
-	for (auto &entry : metadata.snapshots) {
-		auto &snapshot = entry.second;
-		if (!snapshot.sequence_number) {
-			throw InvalidConfigurationException("Committed snapshot is missing a sequence number");
+	auto cursor = metadata.FindSnapshotByIdInternal(tip_snapshot_id);
+	//! Each step visits a distinct snapshot of an acyclic history; the bound stops malformed (cyclic) metadata
+	for (idx_t steps = 0; cursor && steps <= metadata.snapshots.size(); steps++) {
+		if (cursor->snapshot_id == base_snapshot_id) {
+			return true;
 		}
-		int64_t sequence = *snapshot.sequence_number;
-		if (sequence <= base_sequence || sequence > tip_sequence) {
-			continue;
-		}
-		if (snapshot.operation != IcebergSnapshotOperationType::APPEND) {
+		if (cursor->operation != IcebergSnapshotOperationType::APPEND || !cursor->parent_snapshot_id) {
 			return false;
 		}
+		cursor = metadata.FindSnapshotByIdInternal(*cursor->parent_snapshot_id);
 	}
-	return true;
+	return false;
 }
 
 //! Throw if a retried DELETE can't be safely re-applied. No-op on the first
@@ -299,6 +291,7 @@ static SingleTableStagedCommit StageSingleTableCommit(DatabaseInstance &db, Iceb
 		throw InternalException("A table created in this transaction can not be committed to branch '%s'",
 		                        branch_head.branch);
 	}
+	transaction_data.VerifyCommitBranch(branch_head);
 	auto current_snapshot = branch_head.base_snapshot;
 	transaction_data.VerifyMergeDeletesComplete();
 	info.retryable = transaction_data.SupportsAppendRetry();
@@ -492,6 +485,50 @@ static bool CommitIsRetryable(bool retryable, idx_t max_retries, const CommitRes
 	return true;
 }
 
+//! A commit whose assert-ref-snapshot-id held, while a concurrent commit to another branch of the same table (WAP,
+//! or main while this commit targets a branch) advanced last-sequence-number past the one this attempt was staged
+//! on. Iceberg's TableMetadata builder then rejects the add-snapshot: iceberg-rest-fixture 1.10.1 answers 400
+//! ValidationException "Cannot add snapshot with sequence number N older than last sequence number M". The
+//! rejection is definitive (nothing was committed) and every attempt is validated again by the catalog, so
+//! re-staging on refreshed metadata is safe. It is retried only once the refresh proves last-sequence-number moved
+//! (SequenceNumbersAdvanced); otherwise the stale number is a client bug and the error is surfaced.
+static bool IsStaleSequenceRejection(bool retryable, idx_t max_retries, const CommitResult &result, idx_t attempt) {
+	if (attempt >= max_retries || !retryable) {
+		return false;
+	}
+	if (result.status != HTTPStatusCode::BadRequest_400 || !result.error_) {
+		return false;
+	}
+	auto &error = result.error_->_error;
+	return error.type == "ValidationException" &&
+	       StringUtil::StartsWith(error.message, "Cannot add snapshot with sequence number");
+}
+
+static unordered_map<string, int64_t> CaptureSequenceNumbers(IcebergTransactionAlterUpdate &alter_update,
+                                                             const unordered_set<string> &table_keys) {
+	unordered_map<string, int64_t> result;
+	for (auto &table_key : table_keys) {
+		auto it = alter_update.updated_tables.find(table_key);
+		if (it != alter_update.updated_tables.end()) {
+			result[table_key] = static_cast<int64_t>(it->second.get().table_metadata.last_sequence_number);
+		}
+	}
+	return result;
+}
+
+//! Whether a refresh shows another commit advanced last-sequence-number of a table in 'table_keys'
+static bool SequenceNumbersAdvanced(IcebergTransactionAlterUpdate &alter_update,
+                                    const unordered_map<string, int64_t> &before) {
+	for (auto &entry : before) {
+		auto it = alter_update.updated_tables.find(entry.first);
+		if (it != alter_update.updated_tables.end() &&
+		    static_cast<int64_t>(it->second.get().table_metadata.last_sequence_number) > entry.second) {
+			return true;
+		}
+	}
+	return false;
+}
+
 // 4xx = definitive rejection (commit did not land) -> delete the orphan. 5xx / no HTTP status
 // (connection error/timeout) = outcome unknown (may have landed) -> keep files. Status is in
 // extra_info (HTTPException) or the message "status code (<status>)" (fallback).
@@ -633,12 +670,21 @@ void IcebergTransaction::DoMultiTableCommitUpdates(IcebergTransactionAlterUpdate
 		if (result.Success()) {
 			return;
 		}
+		bool stale_sequence = false;
 		if (!CommitIsRetryable(transaction_info.retryable, transaction_info.retry_config.num_retries, result,
 		                       attempt)) {
-			result.Throw(catalog.GetBaseUrl().GetURLEncoded());
+			stale_sequence = IsStaleSequenceRejection(transaction_info.retryable,
+			                                          transaction_info.retry_config.num_retries, result, attempt);
+			if (!stale_sequence) {
+				result.Throw(catalog.GetBaseUrl().GetURLEncoded());
+			}
 		}
+		auto sequence_numbers = CaptureSequenceNumbers(alter_update, transaction_info.table_keys);
 		CleanupMetadataFiles(context, transaction_info.created_metadata_files);
 		RefreshRetryTables(alter_update, transaction_info.table_keys, context);
+		if (stale_sequence && !SequenceNumbersAdvanced(alter_update, sequence_numbers)) {
+			result.Throw(catalog.GetBaseUrl().GetURLEncoded());
+		}
 		//! Back off before the next attempt to de-synchronize concurrent writers; stop if the
 		//! cumulative retry budget (commit.retry.total-timeout-ms) would be exceeded.
 		if (!backoff->WaitBeforeRetry(attempt)) {
@@ -673,14 +719,23 @@ void IcebergTransaction::DoSingleTableCommitUpdates(IcebergTransactionAlterUpdat
 			return;
 		}
 
+		bool stale_sequence = false;
 		if (!CommitIsRetryable(table_transaction_info.retryable, table_transaction_info.retry_config.num_retries,
 		                       result, attempt)) {
-			result.Throw(catalog.GetBaseUrl().GetURLEncoded());
+			stale_sequence = IsStaleSequenceRejection(table_transaction_info.retryable,
+			                                          table_transaction_info.retry_config.num_retries, result, attempt);
+			if (!stale_sequence) {
+				result.Throw(catalog.GetBaseUrl().GetURLEncoded());
+			}
 		}
-		CleanupMetadataFiles(context, table_transaction_info.created_metadata_files);
 		unordered_set<string> retry_tables;
 		retry_tables.insert(table_key);
+		auto sequence_numbers = CaptureSequenceNumbers(alter_update, retry_tables);
+		CleanupMetadataFiles(context, table_transaction_info.created_metadata_files);
 		RefreshRetryTables(alter_update, retry_tables, context);
+		if (stale_sequence && !SequenceNumbersAdvanced(alter_update, sequence_numbers)) {
+			result.Throw(catalog.GetBaseUrl().GetURLEncoded());
+		}
 		//! Back off before the next attempt; stop if the retry budget would be exceeded.
 		if (!backoff->WaitBeforeRetry(attempt)) {
 			result.Throw(catalog.GetBaseUrl().GetURLEncoded());

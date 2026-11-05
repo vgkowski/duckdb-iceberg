@@ -1,0 +1,716 @@
+# name: test/sql/local/native_catalog/wap_branch_safety.test
+# description: iceberg_wap_branch never reads main in place of a missing branch, keeps pending changes on their branch, and refuses unsafe commits
+# group: [native_catalog]
+
+require-env CATALOG_TEST_CONFIG_SETUP mock
+
+include test/sql/init_requires
+
+require json
+
+# Moves (or creates) a ref through the catalog, as another engine would
+statement ok
+SET VARIABLE set_ref = $$
+SELECT status FROM iceberg_test_catalog_request('POST', '/v1/namespaces/default/tables/TBL',
+	'{"requirements": [], "updates": [{"action": "set-snapshot-ref", "ref-name": "REF", "type": "TYPE", "snapshot-id": SNAP}]}')
+$$;
+
+statement ok
+SET VARIABLE remove_ref = $$
+SELECT status FROM iceberg_test_catalog_request('POST', '/v1/namespaces/default/tables/TBL',
+	'{"requirements": [], "updates": [{"action": "remove-snapshot-ref", "ref-name": "REF"}]}')
+$$;
+
+# ---------------------------------------------------------------------------
+# Setting validation
+
+statement error
+SET GLOBAL iceberg_wap_branch = 'audit';
+----
+can only be set for the session
+
+statement error
+SET iceberg_wap_branch = 'Main';
+----
+must be exactly 'main'
+
+statement error
+SET iceberg_wap_branch = 'MAIN';
+----
+must be exactly 'main'
+
+# Numbers follow Java's Long.parseLong, as AT (VERSION => '...') does
+statement error
+SET iceberg_wap_branch = '+12';
+----
+must not be a number
+
+statement error
+SET iceberg_wap_branch = '-5';
+----
+must not be a number
+
+# Not numbers for Long.parseLong, so these are ref names
+statement ok
+SET iceberg_wap_branch = '1e3';
+
+statement ok
+SET iceberg_wap_branch = '99999999999999999999';
+
+statement ok
+SET iceberg_wap_branch = '0x10';
+
+statement ok
+RESET iceberg_wap_branch;
+
+# ---------------------------------------------------------------------------
+# A missing branch is never read as main
+
+statement ok
+CREATE TABLE my_datalake.default.wap_safe (id INTEGER);
+
+statement ok
+INSERT INTO my_datalake.default.wap_safe VALUES (1), (2);
+
+statement ok
+SET VARIABLE main_1 = (SELECT snapshot_id FROM iceberg_refs(my_datalake.default.wap_safe) WHERE name = 'main');
+
+statement ok
+SET iceberg_wap_branch = 'audit';
+
+statement error
+SELECT count(*) FROM my_datalake.default.wap_safe;
+----
+Iceberg branch 'audit' (set by 'iceberg_wap_branch') does not exist
+
+statement error
+SELECT count(*) FROM iceberg_scan_plan('my_datalake.default.wap_safe');
+----
+Iceberg branch 'audit' (set by 'iceberg_wap_branch') does not exist
+
+statement error
+SELECT count(*) FROM iceberg_files(my_datalake.default.wap_safe);
+----
+Iceberg branch 'audit' (set by 'iceberg_wap_branch') does not exist
+
+statement error
+SELECT count(*) FROM iceberg_metadata(my_datalake.default.wap_safe);
+----
+Iceberg branch 'audit' (set by 'iceberg_wap_branch') does not exist
+
+# DELETE, UPDATE and MERGE read the branch first
+statement error
+DELETE FROM my_datalake.default.wap_safe WHERE id = 1;
+----
+Iceberg branch 'audit' (set by 'iceberg_wap_branch') does not exist
+
+# Main stays readable explicitly
+query I
+SELECT count(*) FROM my_datalake.default.wap_safe AT (VERSION => 'main');
+----
+2
+
+# Strict mode refuses to create the branch
+statement ok
+SET iceberg_wap_branch_create_missing = false;
+
+statement error
+INSERT INTO my_datalake.default.wap_safe VALUES (3);
+----
+does not exist in table "wap_safe", and 'iceberg_wap_branch_create_missing' is false
+
+query I
+SELECT count(*) FROM iceberg_refs(my_datalake.default.wap_safe) WHERE name = 'audit';
+----
+0
+
+statement ok
+RESET iceberg_wap_branch_create_missing;
+
+# A transaction that creates the branch reads its pending state
+statement ok
+BEGIN;
+
+statement ok
+INSERT INTO my_datalake.default.wap_safe VALUES (3);
+
+query I
+SELECT id FROM my_datalake.default.wap_safe ORDER BY id;
+----
+1
+2
+3
+
+# An explicit read of main does not see changes staged for the branch
+query I
+SELECT id FROM my_datalake.default.wap_safe AT (VERSION => 'main') ORDER BY id;
+----
+1
+2
+
+statement ok
+COMMIT;
+
+statement ok
+SET VARIABLE audit_1 = (SELECT snapshot_id FROM iceberg_refs(my_datalake.default.wap_safe) WHERE name = 'audit');
+
+# Strict mode still writes to an existing branch
+statement ok
+SET iceberg_wap_branch_create_missing = false;
+
+statement ok
+INSERT INTO my_datalake.default.wap_safe VALUES (4);
+
+statement ok
+RESET iceberg_wap_branch_create_missing;
+
+# Pending changes are visible exactly on the branch they target
+statement ok
+BEGIN;
+
+statement ok
+INSERT INTO my_datalake.default.wap_safe VALUES (5);
+
+query I
+SELECT count(*) FROM my_datalake.default.wap_safe;
+----
+5
+
+query I
+SELECT count(*) FROM my_datalake.default.wap_safe AT (VERSION => 'audit');
+----
+5
+
+query I
+SELECT count(*) FROM my_datalake.default.wap_safe AT (VERSION => 'main');
+----
+2
+
+statement ok
+COMMIT;
+
+statement ok
+RESET iceberg_wap_branch;
+
+statement ok
+BEGIN;
+
+statement ok
+INSERT INTO my_datalake.default.wap_safe VALUES (100);
+
+query I
+SELECT count(*) FROM my_datalake.default.wap_safe;
+----
+3
+
+query I
+SELECT count(*) FROM my_datalake.default.wap_safe AT (VERSION => 'main');
+----
+3
+
+query I
+SELECT count(*) FROM my_datalake.default.wap_safe AT (VERSION => 'audit');
+----
+5
+
+statement ok
+COMMIT;
+
+# Metadata functions, iceberg_scan and iceberg_scan_plan read the WAP branch unless a snapshot option is given
+statement ok
+SET iceberg_wap_branch = 'audit';
+
+query I
+SELECT count(*) FROM iceberg_files(my_datalake.default.wap_safe);
+----
+4
+
+query I
+SELECT count(*) FROM iceberg_files(my_datalake.default.wap_safe, snapshot_from_ref => 'main');
+----
+2
+
+query I
+SELECT count(*) FROM iceberg_metadata(my_datalake.default.wap_safe);
+----
+4
+
+query I
+SELECT count(*) FROM iceberg_manifests(my_datalake.default.wap_safe);
+----
+4
+
+query I
+SELECT count(*) FROM iceberg_scan('my_datalake.default.wap_safe');
+----
+5
+
+query I
+SELECT count(*) FROM iceberg_scan_plan('my_datalake.default.wap_safe');
+----
+4
+
+query I
+SELECT count(*) FROM iceberg_scan_plan('my_datalake.default.wap_safe', snapshot_from_ref => 'main');
+----
+2
+
+# Rollback and rewrite move main, so they are refused while a branch is targeted
+statement error
+SELECT * FROM iceberg_rollback_to_snapshot('my_datalake.default.wap_safe', getvariable('main_1'));
+----
+rollback moves main
+
+statement error
+SELECT * FROM iceberg_rewrite_data_files('my_datalake.default.wap_safe', rewrite_all := true);
+----
+Cannot rewrite data files of table "wap_safe" while 'iceberg_wap_branch' is set to 'audit'
+
+statement ok
+RESET iceberg_wap_branch;
+
+query I
+SELECT count(*) FROM my_datalake.default.wap_safe;
+----
+3
+
+statement ok
+DROP TABLE my_datalake.default.wap_safe;
+
+# ---------------------------------------------------------------------------
+# A branch write to a table whose main has no snapshot leaves main empty
+
+statement ok
+CREATE TABLE my_datalake.default.wap_empty (id INTEGER);
+
+statement ok
+SET iceberg_wap_branch = 'audit';
+
+statement ok
+INSERT INTO my_datalake.default.wap_empty VALUES (1);
+
+query I
+SELECT id FROM my_datalake.default.wap_empty;
+----
+1
+
+query I
+SELECT parent_id IS NULL FROM iceberg_snapshots(my_datalake.default.wap_empty);
+----
+true
+
+statement ok
+RESET iceberg_wap_branch;
+
+query I
+SELECT count(*) FROM my_datalake.default.wap_empty;
+----
+0
+
+query T
+SELECT name FROM iceberg_refs(my_datalake.default.wap_empty) ORDER BY name;
+----
+audit
+
+query I
+SELECT coalesce((metadata::JSON->>'current-snapshot-id')::BIGINT, -1) = -1
+FROM iceberg_load_table_response(my_datalake.default.wap_empty);
+----
+true
+
+statement ok
+DROP TABLE my_datalake.default.wap_empty;
+
+# ---------------------------------------------------------------------------
+# DELETE retries on a branch (write.delete.isolation-level = snapshot)
+
+statement ok
+CREATE TABLE my_datalake.default.wap_del (id INTEGER) WITH ('write.delete.isolation-level' = 'snapshot');
+
+statement ok
+INSERT INTO my_datalake.default.wap_del VALUES (1), (2), (3);
+
+statement ok
+SET VARIABLE del_main = (SELECT snapshot_id FROM iceberg_refs(my_datalake.default.wap_del) WHERE name = 'main');
+
+statement ok con1
+SET iceberg_wap_branch = 'audit';
+
+statement ok con2
+SET iceberg_wap_branch = 'audit';
+
+statement ok con1
+INSERT INTO my_datalake.default.wap_del VALUES (4);
+
+statement ok
+SET VARIABLE del_a1 = (SELECT snapshot_id FROM iceberg_refs(my_datalake.default.wap_del) WHERE name = 'audit');
+
+statement ok con1
+INSERT INTO my_datalake.default.wap_del VALUES (5);
+
+# A DELETE is re-applied over concurrent appends to its branch
+statement ok con1
+BEGIN;
+
+statement ok con1
+DELETE FROM my_datalake.default.wap_del WHERE id = 1;
+
+statement ok con2
+INSERT INTO my_datalake.default.wap_del VALUES (6);
+
+statement ok con1
+COMMIT;
+
+query I con1
+SELECT id FROM my_datalake.default.wap_del ORDER BY id;
+----
+2
+3
+4
+5
+6
+
+# ... and over concurrent commits to main, which are not on its branch
+statement ok con1
+BEGIN;
+
+statement ok con1
+DELETE FROM my_datalake.default.wap_del WHERE id = 2;
+
+statement ok
+DELETE FROM my_datalake.default.wap_del WHERE id = 3;
+
+statement ok con1
+COMMIT;
+
+query I con1
+SELECT id FROM my_datalake.default.wap_del ORDER BY id;
+----
+3
+4
+5
+6
+
+query I
+SELECT id FROM my_datalake.default.wap_del ORDER BY id;
+----
+1
+2
+
+# A branch reset to an older snapshot while the DELETE ran: its base is no longer on the branch
+statement ok con1
+BEGIN;
+
+statement ok con1
+DELETE FROM my_datalake.default.wap_del WHERE id = 4;
+
+query I
+SELECT * FROM query(getvariable('set_ref').replace('TBL', 'wap_del').replace('REF', 'audit').replace('TYPE', 'branch').replace('SNAP', getvariable('del_a1')::VARCHAR));
+----
+200
+
+statement error con1
+COMMIT;
+----
+conflicts with a concurrent commit
+
+query I con1
+SELECT id FROM my_datalake.default.wap_del ORDER BY id;
+----
+1
+2
+3
+4
+
+# A branch recreated from main while the DELETE ran
+statement ok con1
+BEGIN;
+
+statement ok con1
+DELETE FROM my_datalake.default.wap_del WHERE id = 1;
+
+query I
+SELECT * FROM query(getvariable('remove_ref').replace('TBL', 'wap_del').replace('REF', 'audit'));
+----
+200
+
+query I
+SELECT * FROM query(getvariable('set_ref').replace('TBL', 'wap_del').replace('REF', 'audit').replace('TYPE', 'branch').replace('SNAP', getvariable('del_main')::VARCHAR));
+----
+200
+
+statement error con1
+COMMIT;
+----
+conflicts with a concurrent commit
+
+# A branch removed while the transaction ran is not recreated from main
+statement ok con1
+BEGIN;
+
+statement ok con1
+INSERT INTO my_datalake.default.wap_del VALUES (7);
+
+query I
+SELECT * FROM query(getvariable('remove_ref').replace('TBL', 'wap_del').replace('REF', 'audit'));
+----
+200
+
+statement error con1
+COMMIT;
+----
+was removed concurrently
+
+query T
+SELECT name FROM iceberg_refs(my_datalake.default.wap_del) ORDER BY name;
+----
+main
+
+# A branch created as a tag while the transaction ran is not written to
+statement ok con1
+BEGIN;
+
+statement ok con1
+INSERT INTO my_datalake.default.wap_del VALUES (8);
+
+query I
+SELECT * FROM query(getvariable('set_ref').replace('TBL', 'wap_del').replace('REF', 'audit').replace('TYPE', 'tag').replace('SNAP', getvariable('del_main')::VARCHAR));
+----
+200
+
+statement error con1
+COMMIT;
+----
+is a tag, not a branch
+
+query TT
+SELECT name, type FROM iceberg_refs(my_datalake.default.wap_del) ORDER BY name;
+----
+audit	TAG
+main	BRANCH
+
+# None of this moved main past the plain main DELETE
+query I
+SELECT count(*) FROM iceberg_snapshots(my_datalake.default.wap_del)
+WHERE snapshot_id = (SELECT snapshot_id FROM iceberg_refs(my_datalake.default.wap_del) WHERE name = 'main')
+AND parent_id = getvariable('del_main');
+----
+1
+
+statement ok con1
+RESET iceberg_wap_branch;
+
+statement ok con2
+RESET iceberg_wap_branch;
+
+statement ok
+DROP TABLE my_datalake.default.wap_del;
+
+# ---------------------------------------------------------------------------
+# Multi-table transactions: each table commits to the branch it was written under
+
+statement ok
+CREATE TABLE my_datalake.default.wap_t1 (id INTEGER);
+
+statement ok
+CREATE TABLE my_datalake.default.wap_t2 (id INTEGER);
+
+statement ok
+INSERT INTO my_datalake.default.wap_t1 VALUES (1);
+
+statement ok
+INSERT INTO my_datalake.default.wap_t2 VALUES (1);
+
+statement ok
+SET VARIABLE t1_main = (SELECT snapshot_id FROM iceberg_refs(my_datalake.default.wap_t1) WHERE name = 'main');
+
+statement ok
+SET VARIABLE t2_main = (SELECT snapshot_id FROM iceberg_refs(my_datalake.default.wap_t2) WHERE name = 'main');
+
+statement ok
+BEGIN;
+
+statement ok
+SET iceberg_wap_branch = 'b1';
+
+statement ok
+INSERT INTO my_datalake.default.wap_t1 VALUES (2);
+
+statement ok
+SET iceberg_wap_branch = 'b2';
+
+statement ok
+INSERT INTO my_datalake.default.wap_t2 VALUES (2);
+
+statement ok
+COMMIT;
+
+statement ok
+RESET iceberg_wap_branch;
+
+query TT
+SELECT name, snapshot_id = getvariable('t1_main') FROM iceberg_refs(my_datalake.default.wap_t1) ORDER BY name;
+----
+b1	false
+main	true
+
+query TT
+SELECT name, snapshot_id = getvariable('t2_main') FROM iceberg_refs(my_datalake.default.wap_t2) ORDER BY name;
+----
+b2	false
+main	true
+
+query I
+SELECT count(*) FROM my_datalake.default.wap_t1 AT (VERSION => 'b1');
+----
+2
+
+query I
+SELECT count(*) FROM my_datalake.default.wap_t2 AT (VERSION => 'b2');
+----
+2
+
+# One table on a branch, the other on main
+statement ok
+BEGIN;
+
+statement ok
+SET iceberg_wap_branch = 'b1';
+
+statement ok
+INSERT INTO my_datalake.default.wap_t1 VALUES (3);
+
+statement ok
+RESET iceberg_wap_branch;
+
+statement ok
+INSERT INTO my_datalake.default.wap_t2 VALUES (3);
+
+statement ok
+COMMIT;
+
+query I
+SELECT snapshot_id = getvariable('t1_main') FROM iceberg_refs(my_datalake.default.wap_t1) WHERE name = 'main';
+----
+true
+
+query I
+SELECT count(*) FROM my_datalake.default.wap_t1 AT (VERSION => 'b1');
+----
+3
+
+query I
+SELECT count(*) FROM my_datalake.default.wap_t2;
+----
+2
+
+query I
+SELECT count(*) FROM my_datalake.default.wap_t2 AT (VERSION => 'b2');
+----
+2
+
+statement ok
+DROP TABLE my_datalake.default.wap_t1;
+
+statement ok
+DROP TABLE my_datalake.default.wap_t2;
+
+# ---------------------------------------------------------------------------
+# Format version 3: UPDATE and MERGE on a branch keep row lineage, and concurrent main writes keep row ids unique
+
+statement ok
+CREATE TABLE my_datalake.default.wap_v3 (id INTEGER, v VARCHAR) WITH ('format-version' = 3);
+
+statement ok
+INSERT INTO my_datalake.default.wap_v3 VALUES (1, 'a'), (2, 'b');
+
+# UPDATE reads the branch, so it must exist: create it at main, as another engine would
+statement ok
+SET VARIABLE v3_main = (SELECT snapshot_id FROM iceberg_refs(my_datalake.default.wap_v3) WHERE name = 'main');
+
+query I
+SELECT * FROM query(getvariable('set_ref').replace('TBL', 'wap_v3').replace('REF', 'audit').replace('TYPE', 'branch').replace('SNAP', getvariable('v3_main')::VARCHAR));
+----
+200
+
+statement ok
+SET iceberg_wap_branch = 'audit';
+
+statement ok
+UPDATE my_datalake.default.wap_v3 SET v = 'A' WHERE id = 1;
+
+statement ok
+SET VARIABLE audit_seq = (SELECT sequence_number FROM iceberg_snapshots(my_datalake.default.wap_v3)
+	WHERE snapshot_id = (SELECT snapshot_id FROM iceberg_refs(my_datalake.default.wap_v3) WHERE name = 'audit'));
+
+query ITIT
+SELECT id, v, _row_id, _last_updated_sequence_number = getvariable('audit_seq')
+FROM my_datalake.default.wap_v3 ORDER BY id;
+----
+1	A	0	true
+2	b	1	false
+
+statement ok
+MERGE INTO my_datalake.default.wap_v3 t
+USING (VALUES (2, 'B'), (3, 'c')) s(id, v) ON t.id = s.id
+WHEN MATCHED THEN UPDATE SET v = s.v
+WHEN NOT MATCHED THEN INSERT VALUES (s.id, s.v);
+
+statement ok
+SET VARIABLE audit_seq = (SELECT sequence_number FROM iceberg_snapshots(my_datalake.default.wap_v3)
+	WHERE snapshot_id = (SELECT snapshot_id FROM iceberg_refs(my_datalake.default.wap_v3) WHERE name = 'audit'));
+
+query ITIT
+SELECT id, v, _row_id, _last_updated_sequence_number = getvariable('audit_seq')
+FROM my_datalake.default.wap_v3 ORDER BY id;
+----
+1	A	0	false
+2	B	1	true
+3	c	4	true
+
+# Main is untouched
+query TII
+SELECT v, _row_id, _last_updated_sequence_number FROM my_datalake.default.wap_v3 AT (VERSION => 'main') ORDER BY id;
+----
+a	0	1
+b	1	1
+
+# A branch write concurrent with a main write
+statement ok con1
+SET iceberg_wap_branch = 'audit';
+
+statement ok con1
+BEGIN;
+
+statement ok con1
+INSERT INTO my_datalake.default.wap_v3 VALUES (10, 'branch');
+
+statement ok con2
+INSERT INTO my_datalake.default.wap_v3 VALUES (20, 'main');
+
+statement ok con1
+COMMIT;
+
+statement ok con1
+RESET iceberg_wap_branch;
+
+query II
+SELECT id, _row_id FROM my_datalake.default.wap_v3 AT (VERSION => 'audit') ORDER BY id;
+----
+1	0
+2	1
+3	4
+10	6
+
+query II
+SELECT id, _row_id FROM my_datalake.default.wap_v3 AT (VERSION => 'main') ORDER BY id;
+----
+1	0
+2	1
+20	5
+
+statement ok
+RESET iceberg_wap_branch;
+
+statement ok
+DROP TABLE my_datalake.default.wap_v3;
