@@ -201,6 +201,7 @@ TableFunctionSet IcebergFunctions::GetIcebergScanPlanFunction() {
 		options.Add("row_filter", LogicalType::VARCHAR)
 		    .Add("produce_sequence_number", LogicalType::BOOLEAN)
 		    .Add("snapshot_from_id", LogicalType::UBIGINT)
+		    .Add("snapshot_from_ref", LogicalType::VARCHAR)
 		    .Add("snapshot_from_timestamp", LogicalType::TIMESTAMP_MS)
 		    // The location options iceberg_scan takes, for a table given by its
 		    // location.

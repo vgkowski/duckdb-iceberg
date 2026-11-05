@@ -1,6 +1,9 @@
 #include "core/metadata/iceberg_table_metadata.hpp"
 
 #include "duckdb/common/exception.hpp"
+#include "duckdb/common/string_util.hpp"
+
+#include <algorithm>
 
 #include "common/iceberg_utils.hpp"
 #include "catalog/rest/api/catalog_utils.hpp"
@@ -152,6 +155,43 @@ optional_ptr<const IcebergSnapshot> IcebergTableMetadata::GetSnapshotById(int64_
 	return snapshot;
 }
 
+optional_ptr<const IcebergSnapshot> IcebergTableMetadata::GetSnapshotByRef(const string &ref_name,
+                                                                           bool &is_branch) const {
+	optional<int64_t> snapshot_id;
+	string ref_type;
+	if (refs) {
+		auto entry = refs->additional_properties.find(ref_name);
+		if (entry != refs->additional_properties.end()) {
+			snapshot_id = entry->second.snapshot_id;
+			ref_type = StringUtil::Lower(entry->second.type);
+		}
+	}
+	if (!snapshot_id && ref_name == "main" && current_snapshot_id) {
+		//! Older metadata has no refs, so 'main' is the current snapshot
+		snapshot_id = *current_snapshot_id;
+		ref_type = "branch";
+	}
+	if (!snapshot_id) {
+		vector<string> available;
+		if (refs) {
+			for (auto &entry : refs->additional_properties) {
+				available.push_back(entry.first);
+			}
+		}
+		std::sort(available.begin(), available.end());
+		throw InvalidInputException("Iceberg ref '%s' does not exist (available refs: %s)", ref_name,
+		                            available.empty() ? "none" : StringUtil::Join(available, ", "));
+	}
+	is_branch = ref_type != "tag";
+	auto snapshot = FindSnapshotByIdInternal(*snapshot_id);
+	if (!snapshot) {
+		throw InvalidConfigurationException(
+		    "Iceberg ref '%s' points at snapshot %s, which is not in the table metadata", ref_name,
+		    std::to_string(*snapshot_id));
+	}
+	return snapshot;
+}
+
 IcebergSnapshotScanInfo IcebergTableMetadata::GetSnapshot(const IcebergSnapshotLookup &lookup) const {
 	IcebergSnapshotScanInfo snapshot_info;
 	switch (lookup.GetSource()) {
@@ -163,6 +203,15 @@ IcebergSnapshotScanInfo IcebergTableMetadata::GetSnapshot(const IcebergSnapshotL
 		snapshot_info.snapshot = GetSnapshotById(lookup.GetSnapshotId());
 		snapshot_info.schema_id = snapshot_info.snapshot->GetSchemaId();
 		return snapshot_info;
+	case SnapshotSource::FROM_REF: {
+		auto &ref = lookup.GetSnapshotRef();
+		bool is_branch;
+		snapshot_info.snapshot = GetSnapshotByRef(ref.name, is_branch);
+		//! Iceberg spec "Schema selection with branches and tags": a branch reads with the table's
+		//! current schema, a tag with the schema of its snapshot
+		snapshot_info.schema_id = is_branch ? GetCurrentSchemaId() : snapshot_info.snapshot->GetSchemaId();
+		return snapshot_info;
+	}
 	case SnapshotSource::FROM_TIMESTAMP:
 		snapshot_info.snapshot = GetSnapshotByTimestampMS(lookup.GetSnapshotTimestamp());
 		if (!snapshot_info.snapshot) {
@@ -611,12 +660,12 @@ string IcebergTableMetadata::GetTableProperty(string property_string) const {
 }
 
 string IcebergTableMetadata::GetDeleteCompressionCodec() const {
-  // The delete file codec defaults to the data file codec
-  auto codec = GetTableProperty(WRITE_DELETE_PARQUET_COMPRESSION_CODEC);
-  if (codec.empty()) {
-    codec = GetTableProperty(WRITE_PARQUET_COMPRESSION_CODEC);
-  }
-  return codec;
+	// The delete file codec defaults to the data file codec
+	auto codec = GetTableProperty(WRITE_DELETE_PARQUET_COMPRESSION_CODEC);
+	if (codec.empty()) {
+		codec = GetTableProperty(WRITE_PARQUET_COMPRESSION_CODEC);
+	}
+	return codec;
 }
 
 bool IcebergTableMetadata::AllowsMergeOnRead(const string &write_mode_property) const {

@@ -664,7 +664,8 @@ optional_ptr<CatalogEntry> IcebergTable::GetSchemaVersion(optional_ptr<BoundAtCl
 
 	int32_t schema_id;
 	if (!snapshot_lookup.IsLatest() && snapshot_info.snapshot) {
-		schema_id = snapshot_info.snapshot->GetSchemaId();
+		//! Branch reads use the current schema; ids, timestamps and tags use the snapshot's schema
+		schema_id = snapshot_info.schema_id;
 	} else {
 		schema_id = table_metadata.GetCurrentSchemaId();
 	}

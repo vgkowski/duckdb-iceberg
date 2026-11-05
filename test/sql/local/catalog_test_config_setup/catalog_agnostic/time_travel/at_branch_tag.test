@@ -1,0 +1,48 @@
+# name: test/sql/local/catalog_test_config_setup/catalog_agnostic/time_travel/at_branch_tag.test
+# description: AT (VERSION => '<ref>') reads a branch or tag by name, as in Spark and Trino (duckdb-iceberg#1252)
+# group: [time_travel]
+
+require-env CATALOG_TEST_CONFIG_SETUP
+
+require-env TIMETRAVEL_SUPPORT
+
+include test/sql/init_requires
+
+statement ok
+drop table if exists my_datalake.default.at_branch_tag;
+
+statement ok
+create table my_datalake.default.at_branch_tag (id INTEGER);
+
+statement ok
+insert into my_datalake.default.at_branch_tag values (1), (2);
+
+statement ok
+insert into my_datalake.default.at_branch_tag values (3);
+
+query I
+select count(*) from my_datalake.default.at_branch_tag AT (VERSION => 'main');
+----
+3
+
+# A numeric string is still a snapshot id
+statement ok
+set variable first_snapshot = (
+	select snapshot_id from iceberg_snapshots(my_datalake.default.at_branch_tag) order by sequence_number limit 1
+);
+
+statement ok
+set variable q = $$ select count(*) from my_datalake.default.at_branch_tag AT (VERSION => 'SNAP') $$;
+
+query I
+select * from query(getvariable('q').replace('SNAP', getvariable('first_snapshot')::VARCHAR));
+----
+2
+
+statement error
+select count(*) from my_datalake.default.at_branch_tag AT (VERSION => 'audit');
+----
+Iceberg ref 'audit' does not exist
+
+statement ok
+drop table my_datalake.default.at_branch_tag;

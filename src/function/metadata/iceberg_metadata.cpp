@@ -193,7 +193,8 @@ TableFunctionSet IcebergFunctions::GetIcebergMetadataFunction() {
 		    .Add("version", LogicalType::ANY)
 		    .Add("version_name_format", LogicalType::VARCHAR)
 		    .Add("snapshot_from_timestamp", LogicalType::ANY)
-		    .Add("snapshot_from_id", LogicalType::UBIGINT);
+		    .Add("snapshot_from_id", LogicalType::UBIGINT)
+		    .Add("snapshot_from_ref", LogicalType::VARCHAR);
 	});
 	function_set.AddFunction(fun);
 

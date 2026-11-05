@@ -90,6 +90,8 @@ public:
 
 	optional_ptr<const IcebergSnapshot> GetSnapshotById(int64_t snapshot_id) const;
 	optional_ptr<const IcebergSnapshot> GetSnapshotByTimestampMS(timestamp_ms_t timestamp) const;
+	//! Resolves a branch or tag from 'refs'; throws if it is missing
+	optional_ptr<const IcebergSnapshot> GetSnapshotByRef(const string &ref_name, bool &is_branch) const;
 
 	//! Version extraction and identification
 	static bool UnsafeVersionGuessingEnabled(ClientContext &context);
@@ -119,9 +121,9 @@ public:
 
 	const case_insensitive_map_t<string> &GetTableProperties() const;
 	string GetTableProperty(string property_string) const;
-  string GetDeleteCompressionCodec() const;
+	string GetDeleteCompressionCodec() const;
 
-  static void VerifyNotReservedProperty(const string &key, const string &operation);
+	static void VerifyNotReservedProperty(const string &key, const string &operation);
 	//! Whether the given write mode property (write.delete.mode, write.update.mode or write.merge.mode) allows
 	//! writing merge-on-read delete files
 	bool AllowsMergeOnRead(const string &write_mode_property) const;
