@@ -3,6 +3,7 @@ add_library(
   iceberg_column_stats.cpp
   iceberg_expire_snapshots.cpp
   iceberg_load_table_response.cpp
+  iceberg_manage_refs.cpp
   iceberg_view_metadata.cpp
   iceberg_metadata.cpp
   iceberg_partition_stats.cpp

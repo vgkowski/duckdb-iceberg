@@ -50,6 +50,77 @@ of those snapshots: the updates cannot preserve an ID that has not been assigned
 yet. After commit, further updates preserve its assigned ID. Use a business key
 to identify pending rows, rather than relying on their nullable lineage columns.
 
+## Branches and tags
+
+Tables in an attached REST catalog can be read at a branch or tag with
+`AT (VERSION => 'name')`, and their refs managed with:
+
+```sql
+SELECT * FROM iceberg_create_branch('cat.ns.tbl', 'dev', snapshot_id := 123,
+    max_ref_age_ms := 86400000, max_snapshot_age_ms := 3600000, min_snapshots_to_keep := 2);
+SELECT * FROM iceberg_create_tag('cat.ns.tbl', 'v1', max_ref_age_ms := 86400000);
+SELECT * FROM iceberg_drop_branch('cat.ns.tbl', 'dev');
+SELECT * FROM iceberg_drop_tag('cat.ns.tbl', 'v1');
+SELECT * FROM iceberg_fast_forward('cat.ns.tbl', 'main', 'dev');
+SELECT * FROM iceberg_set_current_snapshot('cat.ns.tbl', snapshot_id := 123);
+SELECT * FROM iceberg_set_current_snapshot('cat.ns.tbl', ref := 'dev');
+```
+
+- Without `snapshot_id`, a new ref points at the current snapshot of `main`.
+  Retention values must be positive; tags accept only `max_ref_age_ms`.
+- Ref changes are staged in the transaction and become visible only after it
+  commits. Until then, reads in the same transaction see the refs as they were
+  when the transaction read the table: `AT (VERSION => ...)` does not see a new
+  or moved ref, and a plain read still shows the old `main` after
+  `iceberg_fast_forward` or `iceberg_set_current_snapshot` moved it.
+- Ref changes are published in one atomic catalog commit that asserts every ref
+  involved (and `main`, for a ref created at its current snapshot) still points
+  where it was read, so a concurrent change aborts the commit. Such a commit is
+  never retried, and that includes appends to other tables committed in the
+  same transaction.
+- Snapshot ids and retention values must be integers; fractional values are
+  refused, not rounded.
+- `iceberg_fast_forward(table, branch, to)` moves `branch` forward to the
+  snapshot of `to`, which must be a descendant. As in Spark, fast-forwarding a
+  branch that does not exist creates it at that snapshot (`previous_ref` is
+  NULL), and a branch already at that snapshot is left unchanged
+  ([UpdateSnapshotReferencesOperation.java:117-147](https://github.com/apache/iceberg/blob/apache-iceberg-1.10.0/core/src/main/java/org/apache/iceberg/UpdateSnapshotReferencesOperation.java#L117-L147),
+  client-side). `main` is never created this way.
+- `iceberg_set_current_snapshot` moves `main` to any snapshot, without an
+  ancestry check. Pass exactly one of `snapshot_id` and `ref`, as in Spark
+  ([SetCurrentSnapshotProcedure.java:46-90](https://github.com/apache/iceberg/blob/apache-iceberg-1.10.0/spark/v3.5/spark/src/main/java/org/apache/iceberg/spark/procedures/SetCurrentSnapshotProcedure.java#L46-L90)).
+- A ref argument is always a ref name, even when it looks like a number
+  (`ref := '123'` names a ref; use `snapshot_id := 123` for a snapshot id).
+- `main` cannot be created or dropped. It must be a branch: moving a `main`
+  that is a tag is refused. A ref can change only once per transaction. Refs
+  cannot change after the table's rows were changed in the same transaction,
+  and rows cannot change after a ref change.
+- Ref names are case-sensitive. A name made only of digits, with an optional
+  leading sign (such as `123` or `-7`), is refused on create: `AT (VERSION => '123')`
+  reads snapshot id 123, so such a ref could not be read by name. New ref names
+  are also refused if they contain non-ASCII digits (Java's `Long.parseLong` accepts
+  every character for which `Character.digit` is non-negative, so it reads them as
+  digits, client-side:
+  [Long.parseLong](https://docs.oracle.com/en/java/javase/17/docs/api/java.base/java/lang/Long.html#parseLong(java.lang.String,int))),
+  spell `main` with other
+  capitalization (it would be a separate branch easily mistaken for main), contain
+  control characters, start or end with whitespace, or are longer than 255 bytes.
+- Spark's `IF EXISTS`, `IF NOT EXISTS` and `OR REPLACE` forms of the branch and
+  tag DDL are out of scope: creating an existing ref or dropping a missing one
+  is an error.
+- Known gap: a branch or tag created with `snapshot_id :=` at a snapshot other
+  than the head of `main` can be silently removed if another engine expires that
+  snapshot concurrently. The catalog drops refs whose snapshot was removed
+  ([TableMetadata.java:1444-1451](https://github.com/apache/iceberg/blob/apache-iceberg-1.10.0/core/src/main/java/org/apache/iceberg/TableMetadata.java#L1444-L1451),
+  server-side), and an expiration commit asserts no ref it does not move. Java's
+  client has the same gap: it adds no requirement for `remove-snapshots`
+  ([UpdateRequirements.java:96-112](https://github.com/apache/iceberg/blob/apache-iceberg-1.10.0/core/src/main/java/org/apache/iceberg/UpdateRequirements.java#L96-L112),
+  client-side), and the REST spec has no requirement type that would close it.
+  If the expiration commits first, creating the ref fails because its snapshot
+  is unknown ([TableMetadata.java:1312-1315](https://github.com/apache/iceberg/blob/apache-iceberg-1.10.0/core/src/main/java/org/apache/iceberg/TableMetadata.java#L1312-L1315),
+  server-side). Refs created at the head of `main` are not affected: both
+  commits assert `main`, and expiration never removes its head.
+
 ## Development setup
 
 Clone the repository with its DuckDB and extension tooling submodules:

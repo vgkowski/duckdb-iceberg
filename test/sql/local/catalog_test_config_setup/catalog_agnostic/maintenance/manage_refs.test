@@ -1,0 +1,549 @@
+# name: test/sql/local/catalog_test_config_setup/catalog_agnostic/maintenance/manage_refs.test
+# description: Create and drop Iceberg branches and tags, and read them with AT (VERSION => '<ref>')
+# group: [maintenance]
+
+require-env CATALOG_TEST_CONFIG_SETUP
+
+require-env TIMETRAVEL_SUPPORT
+
+include test/sql/init_requires
+
+statement ok
+drop table if exists my_datalake.default.manage_refs;
+
+statement ok
+create table my_datalake.default.manage_refs (id INTEGER);
+
+# a table without a snapshot has no main to branch from
+statement error
+select * from iceberg_create_branch('my_datalake.default.manage_refs', 'audit');
+----
+has no current snapshot
+
+statement ok
+insert into my_datalake.default.manage_refs values (1);
+
+statement ok
+set variable s1 = (select snapshot_id::BIGINT from iceberg_snapshots(my_datalake.default.manage_refs) order by sequence_number desc limit 1);
+
+statement ok
+insert into my_datalake.default.manage_refs values (2);
+
+statement ok
+set variable s2 = (select snapshot_id::BIGINT from iceberg_snapshots(my_datalake.default.manage_refs) order by sequence_number desc limit 1);
+
+# A branch defaults to the current snapshot of main
+query TTT
+select ref_name, ref_type, snapshot_id = getvariable('s2') from iceberg_create_branch('my_datalake.default.manage_refs', 'audit');
+----
+audit	branch	true
+
+# A tag at an older snapshot, with a retention policy
+query TTT
+select ref_name, ref_type, snapshot_id = getvariable('s1') from iceberg_create_tag('my_datalake.default.manage_refs', 'v1', snapshot_id := getvariable('s1'), max_ref_age_ms := 86400000);
+----
+v1	tag	true
+
+# A branch with a retention policy, at a snapshot id taken straight from iceberg_snapshots (UBIGINT)
+statement ok
+set variable s1_unsigned = (select snapshot_id from iceberg_snapshots(my_datalake.default.manage_refs) order by sequence_number limit 1);
+
+statement ok
+select * from iceberg_create_branch('my_datalake.default.manage_refs', 'retained', snapshot_id := getvariable('s1_unsigned'),
+	max_ref_age_ms := 1000, max_snapshot_age_ms := 2000, min_snapshots_to_keep := 3);
+
+query TTTIII
+select name, type, snapshot_id = case when name in ('v1', 'retained') then getvariable('s1') else getvariable('s2') end, max_reference_age_in_ms, min_snapshots_to_keep, max_snapshot_age_in_ms
+from iceberg_refs(my_datalake.default.manage_refs) order by name;
+----
+audit	BRANCH	true	NULL	NULL	NULL
+main	BRANCH	true	NULL	NULL	NULL
+retained	BRANCH	true	1000	3	2000
+v1	TAG	true	86400000	NULL	NULL
+
+query I
+select list(id order by id) from my_datalake.default.manage_refs AT (VERSION => 'v1');
+----
+[1]
+
+query I
+select list(id order by id) from my_datalake.default.manage_refs AT (VERSION => 'audit');
+----
+[1, 2]
+
+# Creating a ref that exists, or one named main, is refused
+statement error
+select * from iceberg_create_branch('my_datalake.default.manage_refs', 'audit');
+----
+Iceberg ref 'audit' already exists
+
+statement error
+select * from iceberg_create_tag('my_datalake.default.manage_refs', 'audit');
+----
+Iceberg ref 'audit' already exists
+
+statement error
+select * from iceberg_create_branch('my_datalake.default.manage_refs', 'main');
+----
+Cannot create ref 'main'
+
+statement error
+select * from iceberg_create_tag('my_datalake.default.manage_refs', 'main');
+----
+Cannot create ref 'main'
+
+# Invalid names and options
+statement error
+select * from iceberg_create_branch('my_datalake.default.manage_refs', '');
+----
+ref_name cannot be empty
+
+statement error
+select * from iceberg_create_branch('my_datalake.default.manage_refs', '12345');
+----
+must not be a number
+
+statement error
+select * from iceberg_create_branch('my_datalake.default.manage_refs', ' padded');
+----
+must not start or end with whitespace
+
+# No case variant of main (ref names are case-sensitive), no non-ASCII digits (Long.parseLong reads them)
+statement error
+select * from iceberg_create_branch('my_datalake.default.manage_refs', 'Main');
+----
+must be exactly 'main' to name main
+
+statement error
+select * from iceberg_create_tag('my_datalake.default.manage_refs', 'v-١');
+----
+must not contain non-ASCII digits
+
+statement error
+select * from iceberg_create_branch('my_datalake.default.manage_refs', NULL);
+----
+ref_name cannot be NULL
+
+statement error
+select * from iceberg_create_branch('my_datalake.default.manage_refs', 'x', snapshot_id := 42);
+----
+unknown snapshot id 42
+
+statement error
+select * from iceberg_create_branch('my_datalake.default.manage_refs', 'x', max_ref_age_ms := 0);
+----
+must be > 0
+
+statement error
+select * from iceberg_create_tag('my_datalake.default.manage_refs', 'x', min_snapshots_to_keep := 1);
+----
+<REGEX>:.*min_snapshots_to_keep.*
+
+# A signed number reads as a snapshot id too, so it cannot name a ref
+foreach digits +12 -7 99999999999999999999999
+
+statement error
+select * from iceberg_create_tag('my_datalake.default.manage_refs', '{digits}');
+----
+must not be a number
+
+endloop
+
+# Snapshot ids must be integers, not rounded
+statement error
+select * from iceberg_create_branch('my_datalake.default.manage_refs', 'x', snapshot_id := 1.5);
+----
+'snapshot_id' must be an integer
+
+statement error
+select * from iceberg_create_branch('my_datalake.default.manage_refs', 'x', snapshot_id := '1');
+----
+'snapshot_id' must be an integer
+
+statement error
+select * from iceberg_set_current_snapshot('my_datalake.default.manage_refs', snapshot_id := 1.5);
+----
+'snapshot_id' must be an integer
+
+statement error
+select * from iceberg_set_current_snapshot('my_datalake.default.manage_refs', snapshot_id := 2.0::DOUBLE);
+----
+'snapshot_id' must be an integer
+
+statement error
+select * from iceberg_set_current_snapshot('my_datalake.default.manage_refs', snapshot_id := '1');
+----
+'snapshot_id' must be an integer
+
+statement error
+select * from iceberg_set_current_snapshot('my_datalake.default.manage_refs', snapshot_id := NULL);
+----
+'snapshot_id' cannot be NULL
+
+statement error
+select * from iceberg_set_current_snapshot('my_datalake.default.manage_refs', ref := NULL);
+----
+ref cannot be NULL
+
+statement error
+select * from iceberg_set_current_snapshot('my_datalake.default.manage_refs', ref := '');
+----
+ref cannot be empty
+
+# Retention values must be integers too, not rounded (1.7 would otherwise become 2)
+statement error
+select * from iceberg_create_branch('my_datalake.default.manage_refs', 'x', max_ref_age_ms := 1.7);
+----
+'max_ref_age_ms' must be an integer, got DECIMAL
+
+statement error
+select * from iceberg_create_branch('my_datalake.default.manage_refs', 'x', max_ref_age_ms := '5');
+----
+'max_ref_age_ms' must be an integer, got VARCHAR
+
+statement error
+select * from iceberg_create_branch('my_datalake.default.manage_refs', 'x', max_snapshot_age_ms := 1.7);
+----
+'max_snapshot_age_ms' must be an integer, got DECIMAL
+
+statement error
+select * from iceberg_create_branch('my_datalake.default.manage_refs', 'x', max_snapshot_age_ms := '5');
+----
+'max_snapshot_age_ms' must be an integer, got VARCHAR
+
+statement error
+select * from iceberg_create_branch('my_datalake.default.manage_refs', 'x', min_snapshots_to_keep := 1.7);
+----
+'min_snapshots_to_keep' must be an integer, got DECIMAL
+
+statement error
+select * from iceberg_create_branch('my_datalake.default.manage_refs', 'x', min_snapshots_to_keep := '5');
+----
+'min_snapshots_to_keep' must be an integer, got VARCHAR
+
+statement error
+select * from iceberg_create_tag('my_datalake.default.manage_refs', 'x', max_ref_age_ms := 1.7);
+----
+'max_ref_age_ms' must be an integer
+
+statement error
+select * from iceberg_create_tag('my_datalake.default.manage_refs', 'x', max_ref_age_ms := '5');
+----
+'max_ref_age_ms' must be an integer
+
+statement error
+select * from iceberg_create_branch('my_datalake.default.manage_refs', 'x', max_ref_age_ms := 18446744073709551615::UBIGINT);
+----
+'max_ref_age_ms' is out of range
+
+statement error
+select * from iceberg_create_branch('my_datalake.default.manage_refs', 'x', min_snapshots_to_keep := 3000000000);
+----
+'min_snapshots_to_keep' is too large
+
+# Integer types other than BIGINT are accepted
+query T
+select ref_name from iceberg_create_branch('my_datalake.default.manage_refs', 'int_retention', max_ref_age_ms := 86400000::UBIGINT, min_snapshots_to_keep := 2::TINYINT);
+----
+int_retention
+
+query II
+select max_reference_age_in_ms, min_snapshots_to_keep from iceberg_refs(my_datalake.default.manage_refs) where name = 'int_retention';
+----
+86400000	2
+
+statement ok
+select * from iceberg_drop_branch('my_datalake.default.manage_refs', 'int_retention');
+
+# A ref argument is always a ref name: a numeric one that is not a ref gets a hint
+statement error
+select * from iceberg_set_current_snapshot('my_datalake.default.manage_refs', ref := getvariable('s1')::VARCHAR);
+----
+a ref argument is always a ref name; pass snapshot_id := to select a snapshot id
+
+statement error
+select * from iceberg_fast_forward('my_datalake.default.manage_refs', 'main', '123');
+----
+a ref argument is always a ref name; to publish a snapshot id use iceberg_set_current_snapshot(snapshot_id := ...)
+
+statement error
+select * from iceberg_set_current_snapshot('my_datalake.default.manage_refs', ref := 'missing');
+----
+<REGEX>:.*Ref 'missing' does not exist[^(]*
+
+# Ref names are case-sensitive
+statement error
+select * from iceberg_drop_branch('my_datalake.default.manage_refs', 'AUDIT');
+----
+Iceberg ref 'AUDIT' does not exist
+
+statement ok
+select * from iceberg_create_tag('my_datalake.default.manage_refs', 'AUDIT', snapshot_id := getvariable('s1'));
+
+query TT
+select name, type from iceberg_refs(my_datalake.default.manage_refs) where lower(name) = 'audit' order by name;
+----
+AUDIT	TAG
+audit	BRANCH
+
+query I
+select list(id order by id) from my_datalake.default.manage_refs AT (VERSION => 'AUDIT');
+----
+[1]
+
+statement ok
+select * from iceberg_drop_tag('my_datalake.default.manage_refs', 'AUDIT');
+
+# One statement cannot change the same ref twice
+statement error
+select * from iceberg_create_branch('my_datalake.default.manage_refs', 'twice') AS a,
+	iceberg_create_tag('my_datalake.default.manage_refs', 'twice') AS b;
+----
+it was already changed in this transaction
+
+statement error
+select * from iceberg_set_current_snapshot('my_datalake.default.manage_refs', snapshot_id := getvariable('s1')) AS a,
+	iceberg_set_current_snapshot('my_datalake.default.manage_refs', snapshot_id := getvariable('s2')) AS b;
+----
+it was already changed in this transaction
+
+# Staged ref changes become visible only at commit, including to AT (VERSION => ...) in the same transaction
+statement ok
+BEGIN;
+
+statement ok
+select * from iceberg_create_branch('my_datalake.default.manage_refs', 'pending');
+
+statement error
+select count(*) from my_datalake.default.manage_refs AT (VERSION => 'pending');
+----
+Iceberg ref 'pending' does not exist
+
+statement ok
+ROLLBACK;
+
+statement ok
+BEGIN;
+
+statement ok
+select * from iceberg_create_branch('my_datalake.default.manage_refs', 'staged');
+
+query I
+select count(*) from iceberg_refs(my_datalake.default.manage_refs) where name = 'staged';
+----
+0
+
+statement ok
+COMMIT;
+
+query I
+select list(id order by id) from my_datalake.default.manage_refs AT (VERSION => 'staged');
+----
+[1, 2]
+
+statement ok
+select * from iceberg_drop_branch('my_datalake.default.manage_refs', 'staged');
+
+# A ref at "the current snapshot" cannot follow a move of main in the same transaction
+statement ok
+BEGIN;
+
+statement ok
+select * from iceberg_set_current_snapshot('my_datalake.default.manage_refs', snapshot_id := getvariable('s1'));
+
+statement error
+select * from iceberg_create_branch('my_datalake.default.manage_refs', 'after_move');
+----
+main was already changed in this transaction; pass snapshot_id
+
+statement ok
+ROLLBACK;
+
+# Dropping main, an unknown ref, or a ref of the other kind is refused
+statement error
+select * from iceberg_drop_branch('my_datalake.default.manage_refs', 'main');
+----
+Cannot drop the main branch
+
+statement error
+select * from iceberg_drop_tag('my_datalake.default.manage_refs', 'main');
+----
+Cannot drop the main branch
+
+statement error
+select * from iceberg_drop_branch('my_datalake.default.manage_refs', 'missing');
+----
+Iceberg ref 'missing' does not exist
+
+statement error
+select * from iceberg_drop_branch('my_datalake.default.manage_refs', 'v1');
+----
+Iceberg ref 'v1' is a tag, not a branch
+
+statement error
+select * from iceberg_drop_tag('my_datalake.default.manage_refs', 'audit');
+----
+Iceberg ref 'audit' is a branch, not a tag
+
+# A ref changes at most once per transaction, and refs cannot change after rows did
+statement ok
+BEGIN;
+
+statement ok
+select * from iceberg_drop_branch('my_datalake.default.manage_refs', 'audit');
+
+statement error
+select * from iceberg_create_branch('my_datalake.default.manage_refs', 'audit');
+----
+it was already changed in this transaction
+
+statement ok
+ROLLBACK;
+
+statement ok
+BEGIN;
+
+statement ok
+insert into my_datalake.default.manage_refs values (3);
+
+statement error
+select * from iceberg_create_branch('my_datalake.default.manage_refs', 'later');
+----
+its rows were already changed in this transaction
+
+statement ok
+ROLLBACK;
+
+statement ok
+BEGIN;
+
+statement ok
+select * from iceberg_create_branch('my_datalake.default.manage_refs', 'later');
+
+statement error
+insert into my_datalake.default.manage_refs values (3);
+----
+after changing its refs in the same transaction
+
+statement ok
+ROLLBACK;
+
+# A rolled back transaction leaves the refs unchanged
+query T
+select list(name order by name) from iceberg_refs(my_datalake.default.manage_refs);
+----
+[audit, main, retained, v1]
+
+# Snapshot expiration is planned from the pre-transaction refs, so it cannot follow ref changes
+statement ok
+BEGIN;
+
+statement ok
+select * from iceberg_create_tag('my_datalake.default.manage_refs', 'pending', snapshot_id := getvariable('s1'));
+
+statement error
+select * from iceberg_expire_snapshots('my_datalake.default.manage_refs', snapshot_ids => [getvariable('s1')], retain_last => 1);
+----
+cannot be combined with snapshot rollback or other ref changes
+
+statement ok
+ROLLBACK;
+
+statement ok
+BEGIN;
+
+statement ok
+select * from iceberg_drop_tag('my_datalake.default.manage_refs', 'v1');
+
+statement error
+select * from iceberg_expire_snapshots('my_datalake.default.manage_refs', snapshot_ids => [getvariable('s1')], retain_last => 1);
+----
+Snapshot expiration cannot follow ref changes in the same transaction
+
+statement ok
+ROLLBACK;
+
+# The rolled-back tag was never published
+query I
+select count(*) from iceberg_refs(my_datalake.default.manage_refs) where name = 'pending';
+----
+0
+
+# Several ref changes commit together
+statement ok
+BEGIN;
+
+query TTT
+select ref_name, ref_type, snapshot_id = getvariable('s2') from iceberg_drop_branch('my_datalake.default.manage_refs', 'audit');
+----
+audit	branch	true
+
+query TTT
+select ref_name, ref_type, snapshot_id = getvariable('s1') from iceberg_drop_tag('my_datalake.default.manage_refs', 'v1');
+----
+v1	tag	true
+
+statement ok
+select * from iceberg_drop_branch('my_datalake.default.manage_refs', 'retained');
+
+statement ok
+COMMIT;
+
+query TT
+select name, snapshot_id = getvariable('s2') from iceberg_refs(my_datalake.default.manage_refs);
+----
+main	true
+
+statement error
+select count(*) from my_datalake.default.manage_refs AT (VERSION => 'audit');
+----
+Iceberg ref 'audit' does not exist
+
+# Main is untouched by all of this
+query I
+select list(id order by id) from my_datalake.default.manage_refs;
+----
+[1, 2]
+
+statement ok
+drop table my_datalake.default.manage_refs;
+
+# A staged snapshot expiration cannot be followed by a ref change, which could point at a removed snapshot
+statement ok
+drop table if exists my_datalake.default.manage_refs_expire;
+
+statement ok
+create table my_datalake.default.manage_refs_expire (id INTEGER);
+
+statement ok
+insert into my_datalake.default.manage_refs_expire values (1);
+
+statement ok
+set variable e1 = (select snapshot_id::BIGINT from iceberg_snapshots(my_datalake.default.manage_refs_expire) order by sequence_number desc limit 1);
+
+statement ok
+insert into my_datalake.default.manage_refs_expire values (2);
+
+statement ok
+BEGIN;
+
+query II
+select * from iceberg_expire_snapshots('my_datalake.default.manage_refs_expire', snapshot_ids => [getvariable('e1')], retain_last => 10);
+----
+1	1
+
+statement error
+select * from iceberg_create_tag('my_datalake.default.manage_refs_expire', 'old', snapshot_id := getvariable('e1'));
+----
+Ref changes cannot be combined with snapshot expiration in the same transaction
+
+statement ok
+ROLLBACK;
+
+query I
+select count(*) from iceberg_refs(my_datalake.default.manage_refs_expire);
+----
+1
+
+statement ok
+drop table my_datalake.default.manage_refs_expire;

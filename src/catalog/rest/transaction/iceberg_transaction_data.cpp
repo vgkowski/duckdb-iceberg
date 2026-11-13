@@ -4,6 +4,8 @@
 
 #include "duckdb/common/multi_file/multi_file_reader.hpp"
 #include "duckdb/common/types/uuid.hpp"
+#include "duckdb/common/operator/cast_operators.hpp"
+#include "duckdb/common/string_util.hpp"
 
 #include "core/metadata/manifest/iceberg_manifest_list.hpp"
 #include "core/metadata/manifest/iceberg_manifest.hpp"
@@ -151,9 +153,15 @@ void IcebergTransactionData::VerifySnapshotExpirationAllowed() const {
 	if (HasTableUpdate(updates, IcebergTableUpdateType::ADD_SNAPSHOT)) {
 		throw TransactionException("Snapshot expiration cannot follow data changes in the same transaction");
 	}
+	//! SET_SNAPSHOT_REF is staged by rollback and by every ref create/move (create_branch, create_tag,
+	//! fast_forward, set_current_snapshot).
 	if (HasTableUpdate(updates, IcebergTableUpdateType::SET_SNAPSHOT_REF)) {
-		throw TransactionException(
-		    "Snapshot expiration cannot be combined with snapshot rollback in the same transaction");
+		throw TransactionException("Snapshot expiration cannot be combined with snapshot rollback or other ref "
+		                           "changes in the same transaction");
+	}
+	//! Ref drops and table replacement remove refs the expiration planner would still see.
+	if (HasTableUpdate(updates, IcebergTableUpdateType::REMOVE_SNAPSHOT_REF)) {
+		throw TransactionException("Snapshot expiration cannot follow ref changes in the same transaction");
 	}
 	if (HasTableUpdate(updates, IcebergTableUpdateType::SET_PROPERTIES) ||
 	    HasTableUpdate(updates, IcebergTableUpdateType::REMOVE_PROPERTIES)) {
@@ -294,6 +302,10 @@ void IcebergTransactionData::VerifyCanAddSnapshot() const {
 	}
 	if (has_maintenance_rewrite) {
 		throw InvalidInputException("Cannot change table \"%s\" after rewriting its data files in the same transaction",
+		                            table_info.name);
+	}
+	if (!modified_refs.empty()) {
+		throw InvalidInputException("Cannot change table \"%s\" after changing its refs in the same transaction",
 		                            table_info.name);
 	}
 }
@@ -441,8 +453,12 @@ void IcebergTransactionData::TableSetDefaultSpec() {
 
 void IcebergTransactionData::TableReplaceContents(IcebergTableMetadata &metadata) {
 	lock_guard<mutex> guard(lock);
-	//! Earlier snapshot updates would be replayed at commit, restoring the contents being replaced.
-	if (!alters.empty() || rolls_back) {
+	//! Expiration is planned from the refs this replacement removes (see VerifySnapshotExpirationAllowed).
+	VerifyNoSnapshotExpiration(updates, "Table replacement");
+	//! Earlier snapshot updates would be replayed at commit, restoring the contents being replaced. Earlier ref
+	//! changes were validated against the refs being replaced, and the replacement's new snapshot could not be
+	//! added after them (VerifyCanAddSnapshot).
+	if (!alters.empty() || rolls_back || !modified_refs.empty()) {
 		throw InvalidInputException("Cannot replace table \"%s\": it was already changed in this transaction",
 		                            table_info.name);
 	}
@@ -454,7 +470,7 @@ void IcebergTransactionData::TableReplaceContents(IcebergTableMetadata &metadata
 	}
 	existing_manifest_list.clear();
 	base_snapshot_id.reset();
-	updates.push_back(make_uniq<RemoveSnapshotRef>("main"));
+	updates.push_back(RemoveSnapshotRef::DetachMain());
 }
 
 void IcebergTransactionData::TableSetProperties(const case_insensitive_map_t<string> &properties) {
@@ -493,6 +509,10 @@ static bool IsAncestorOfCurrentSnapshot(const IcebergTableMetadata &metadata, in
 	if (target_snapshot_id == current_snapshot_id) {
 		return true;
 	}
+	//! Parent ids come from catalog metadata, which may be malformed: a cycle must not loop forever.
+	//! A valid lineage visits each snapshot at most once, so more steps than snapshots means a cycle.
+	const idx_t max_steps = metadata.snapshots.size();
+	idx_t steps = 0;
 	optional_ptr<const IcebergSnapshot> cursor = metadata.FindSnapshotByIdInternal(current_snapshot_id);
 	while (cursor) {
 		if (!cursor->parent_snapshot_id) {
@@ -502,15 +522,85 @@ static bool IsAncestorOfCurrentSnapshot(const IcebergTableMetadata &metadata, in
 		if (parent_id == target_snapshot_id) {
 			return true;
 		}
+		if (++steps > max_steps) {
+			throw InvalidConfigurationException(
+			    "Iceberg snapshot lineage of snapshot %lld contains a cycle in the table metadata",
+			    current_snapshot_id);
+		}
 		cursor = metadata.FindSnapshotByIdInternal(parent_id);
 	}
 	return false;
 }
 
+//! ----------- Ref management -----------
+
+namespace {
+
+struct ResolvedRef {
+	IcebergRefType type;
+	int64_t snapshot_id;
+};
+
+const char *RefTypeName(IcebergRefType type) {
+	return type == IcebergRefType::TAG ? "tag" : "branch";
+}
+
+//! Resolve a ref by its exact (case-sensitive) name, as the catalog will when checking requirements.
+optional<ResolvedRef> FindRef(const IcebergTableMetadata &metadata, const string &ref_name) {
+	if (metadata.refs) {
+		auto &refs = metadata.refs->additional_properties;
+		auto entry = refs.find(ref_name);
+		if (entry != refs.end()) {
+			//! The same case-insensitive type match as reads (IcebergTableMetadata::GetSnapshotByRef), so
+			//! every ref that can be read can also be managed.
+			auto type = StringUtil::Lower(entry->second.type);
+			ResolvedRef result;
+			if (type == "branch") {
+				result.type = IcebergRefType::BRANCH;
+			} else if (type == "tag") {
+				result.type = IcebergRefType::TAG;
+			} else {
+				//! The type comes from metadata, so keep the message bounded
+				static constexpr idx_t MAX_TYPE_LENGTH = 64;
+				auto &raw_type = entry->second.type;
+				auto shown_type =
+				    raw_type.size() > MAX_TYPE_LENGTH ? raw_type.substr(0, MAX_TYPE_LENGTH) + "..." : raw_type;
+				throw InvalidConfigurationException(
+				    "Iceberg ref '%s' has unknown type '%s', expected 'branch' or 'tag'", ref_name, shown_type);
+			}
+			result.snapshot_id = entry->second.snapshot_id;
+			return result;
+		}
+	}
+	if (ref_name == "main" && metadata.current_snapshot_id) {
+		//! Older metadata has no refs, so 'main' is the current snapshot
+		return ResolvedRef {IcebergRefType::BRANCH, *metadata.current_snapshot_id};
+	}
+	return {};
+}
+
+//! numeric_hint: a ref argument is always a ref name, so a name that parses as a snapshot id but is
+//! not a ref gets this hint appended instead of a bare "does not exist".
+ResolvedRef GetExistingRef(const IcebergTableMetadata &metadata, const string &ref_name, const char *description,
+                           const char *numeric_hint = nullptr) {
+	auto ref = FindRef(metadata, ref_name);
+	if (!ref) {
+		int64_t parsed;
+		if (numeric_hint && TryCast::Operation<string_t, int64_t>(string_t(ref_name), parsed, true)) {
+			throw InvalidInputException("%s '%s' does not exist (a ref argument is always a ref name; %s)", description,
+			                            ref_name, numeric_hint);
+		}
+		throw InvalidInputException("%s '%s' does not exist", description, ref_name);
+	}
+	return *ref;
+}
+
+} // namespace
+
 void IcebergTransactionData::TableRollbackToSnapshot(int64_t snapshot_id) {
 	VerifyNoSnapshotExpiration(updates, "Snapshot rollback");
 	//! The commit points main at the last snapshot the transaction adds, which would undo the rollback
-	if (!alters.empty() || rolls_back) {
+	if (!alters.empty() || rolls_back || modified_refs.count("main")) {
 		throw InvalidInputException("Cannot roll back table \"%s\": it was already changed in this transaction",
 		                            table_info.name);
 	}
@@ -524,6 +614,13 @@ void IcebergTransactionData::TableRollbackToSnapshot(int64_t snapshot_id) {
 	if (!current) {
 		throw InvalidInputException("Cannot roll back table with no current snapshot");
 	}
+	//! Moving a branch that is a tag is refused, as Java's client-side TableMetadata.Builder does
+	//! ("Cannot update branch: %s is a tag", apache-iceberg-1.10.0,
+	//! core/src/main/java/org/apache/iceberg/TableMetadata.java:1756).
+	auto main = FindRef(metadata, "main");
+	if (main && main->type != IcebergRefType::BRANCH) {
+		throw InvalidConfigurationException("Iceberg ref 'main' of table \"%s\" is not a branch", table_info.name);
+	}
 	auto current_snapshot_id = current->snapshot_id;
 	if (!IsAncestorOfCurrentSnapshot(metadata, snapshot_id, current_snapshot_id)) {
 		throw InvalidInputException("Cannot roll back to snapshot, not an ancestor of the current state: %lld",
@@ -534,9 +631,215 @@ void IcebergTransactionData::TableRollbackToSnapshot(int64_t snapshot_id) {
 	requirements.push_back(make_uniq<AssertRefSnapshotId>(current_snapshot_id));
 	updates.push_back(make_uniq<SetSnapshotRef>(snapshot_id));
 	rolls_back = true;
+	modified_refs.insert("main");
 
 	// Iceberg intentionally does not roll current-schema-id back with the snapshot;
 	// schema evolution stays forward-only. See https://github.com/apache/iceberg/issues/5591
+}
+
+void IcebergTransactionData::VerifyCanChangeRef(const string &ref_name) const {
+	if (replaces_table) {
+		//! TableReplaceContents detached main from the cached metadata this validation reads.
+		throw InvalidInputException("Cannot change refs of table \"%s\": it was replaced in this transaction",
+		                            table_info.name);
+	}
+	VerifyNoSnapshotExpiration(updates, "Ref changes");
+	if (!alters.empty()) {
+		//! The commit points main at the transaction's last new snapshot, which was based on the old refs.
+		throw InvalidInputException("Cannot change refs of table \"%s\": its rows were already changed in this "
+		                            "transaction",
+		                            table_info.name);
+	}
+	if (modified_refs.count(ref_name)) {
+		throw InvalidInputException("Cannot change ref '%s' of table \"%s\": it was already changed in this "
+		                            "transaction",
+		                            ref_name, table_info.name);
+	}
+}
+
+int64_t IcebergTransactionData::TableCreateRef(const string &ref_name, IcebergRefType ref_type,
+                                               optional<int64_t> snapshot_id,
+                                               const IcebergSnapshotRefRetention &retention) {
+	if (ref_name == "main") {
+		throw InvalidInputException("Cannot create ref 'main': the main branch is managed by writes to the table");
+	}
+	ValidateIcebergRefName(ref_name, "Iceberg ref name");
+	VerifyCanChangeRef(ref_name);
+	auto &metadata = table_info.GetMetadata();
+	if (metadata.refs && metadata.refs->additional_properties.count(ref_name)) {
+		throw InvalidInputException("Iceberg ref '%s' already exists", ref_name);
+	}
+
+	int64_t target_snapshot_id;
+	if (snapshot_id) {
+		if (!metadata.FindSnapshotByIdInternal(*snapshot_id)) {
+			throw InvalidInputException("Cannot create %s '%s': unknown snapshot id %lld", RefTypeName(ref_type),
+			                            ref_name, *snapshot_id);
+		}
+		target_snapshot_id = *snapshot_id;
+	} else {
+		if (modified_refs.count("main")) {
+			//! main would be read at its pre-transaction snapshot, not where this transaction moves it.
+			throw InvalidInputException("Cannot create %s '%s' at the current snapshot of table \"%s\": main was "
+			                            "already changed in this transaction; pass snapshot_id",
+			                            RefTypeName(ref_type), ref_name, table_info.name);
+		}
+		auto main = FindRef(metadata, "main");
+		if (!main) {
+			throw InvalidInputException("Cannot create %s '%s': table \"%s\" has no current snapshot",
+			                            RefTypeName(ref_type), ref_name, table_info.name);
+		}
+		target_snapshot_id = main->snapshot_id;
+		//! The ref is created at the snapshot main had when it was read: a concurrent move of main
+		//! aborts the commit instead of silently tagging a snapshot the caller never saw.
+		requirements.push_back(make_uniq<AssertRefSnapshotId>("main", target_snapshot_id));
+	}
+
+	//! A null snapshot id requires that the ref does not exist when the catalog applies the commit.
+	requirements.push_back(make_uniq<AssertRefSnapshotId>(ref_name, optional<int64_t>()));
+	updates.push_back(SetSnapshotRef::CreateRef(target_snapshot_id, ref_name, RefTypeName(ref_type), retention));
+	modified_refs.insert(ref_name);
+	return target_snapshot_id;
+}
+
+int64_t IcebergTransactionData::TableDropRef(const string &ref_name, IcebergRefType ref_type) {
+	if (ref_name == "main") {
+		throw InvalidInputException("Cannot drop the main branch");
+	}
+	VerifyCanChangeRef(ref_name);
+	auto ref = GetExistingRef(table_info.GetMetadata(), ref_name, "Iceberg ref");
+	if (ref.type != ref_type) {
+		throw InvalidInputException("Iceberg ref '%s' is a %s, not a %s", ref_name, RefTypeName(ref.type),
+		                            RefTypeName(ref_type));
+	}
+	//! A concurrent move of the ref aborts the drop instead of removing a ref we did not inspect.
+	requirements.push_back(make_uniq<AssertRefSnapshotId>(ref_name, ref.snapshot_id));
+	updates.push_back(make_uniq<RemoveSnapshotRef>(ref_name));
+	modified_refs.insert(ref_name);
+	return ref.snapshot_id;
+}
+
+IcebergRefMove IcebergTransactionData::TableFastForward(const string &branch, const string &to) {
+	if (branch.empty() || to.empty()) {
+		throw InvalidInputException("Iceberg ref names cannot be empty");
+	}
+	VerifyCanChangeRef(branch);
+	if (branch != to && modified_refs.count(to)) {
+		throw InvalidInputException("Cannot fast-forward to ref '%s' of table \"%s\": it was already changed in this "
+		                            "transaction",
+		                            to, table_info.name);
+	}
+	auto &metadata = table_info.GetMetadata();
+	//! The checks follow Java's client-side UpdateSnapshotReferencesOperation.replaceBranch, which Spark's
+	//! fast_forward procedure calls (apache-iceberg-1.10.0,
+	//! core/src/main/java/org/apache/iceberg/UpdateSnapshotReferencesOperation.java:117-147): 'to' must exist,
+	//! a missing branch is created at its snapshot, the branch must not be a tag, equal snapshots are a no-op,
+	//! and otherwise the branch's snapshot must be an ancestor of the target.
+	auto target_ref = GetExistingRef(metadata, to, "Ref",
+	                                 "to publish a snapshot id use iceberg_set_current_snapshot(snapshot_id := ...)");
+	if (!metadata.FindSnapshotByIdInternal(target_ref.snapshot_id)) {
+		throw InvalidConfigurationException("Iceberg ref '%s' points at snapshot %lld, which is not in the table "
+		                                    "metadata",
+		                                    to, target_ref.snapshot_id);
+	}
+	IcebergRefMove result;
+	result.updated_snapshot_id = target_ref.snapshot_id;
+
+	auto existing_branch = FindRef(metadata, branch);
+	if (!existing_branch) {
+		//! Java creates the missing branch (UpdateSnapshotReferencesOperation.java:124-126 at 1.10.0). Not for
+		//! main: an absent main means the table has no current snapshot, and creating main publishes one,
+		//! which iceberg_set_current_snapshot does with an explicit assertion that main is absent.
+		if (branch == "main") {
+			throw InvalidInputException("Cannot fast-forward branch 'main' of table \"%s\": it does not exist; use "
+			                            "iceberg_set_current_snapshot to publish a first snapshot",
+			                            table_info.name);
+		}
+		ValidateIcebergRefName(branch, "Iceberg ref name");
+		//! The branch must still be absent, and 'to' still at the snapshot it is created at: a concurrent
+		//! creation of the branch or move of 'to' aborts the commit.
+		requirements.push_back(make_uniq<AssertRefSnapshotId>(branch, optional<int64_t>()));
+		requirements.push_back(make_uniq<AssertRefSnapshotId>(to, target_ref.snapshot_id));
+		updates.push_back(SetSnapshotRef::CreateRef(target_ref.snapshot_id, branch, "branch", {}));
+		modified_refs.insert(branch);
+		return result;
+	}
+	auto &branch_ref = *existing_branch;
+	if (branch_ref.type != IcebergRefType::BRANCH) {
+		throw InvalidInputException("Ref '%s' is a tag, not a branch", branch);
+	}
+
+	result.previous_snapshot_id = branch_ref.snapshot_id;
+	if (branch_ref.snapshot_id == target_ref.snapshot_id) {
+		//! Nothing to publish (Java: "Nothing to replace"; this includes branch == to), but the result reported
+		//! where the branch is: a later change of it in this transaction would contradict that, so it counts as
+		//! changed.
+		modified_refs.insert(branch);
+		return result;
+	}
+	//! Only a strict extension of the branch's history may be published by fast-forward.
+	if (!IsAncestorOfCurrentSnapshot(metadata, branch_ref.snapshot_id, target_ref.snapshot_id)) {
+		throw InvalidInputException("Cannot fast-forward: '%s' is not an ancestor of '%s'", branch, to);
+	}
+
+	//! Both refs must still be where they were validated: a concurrent move of the branch or the source
+	//! aborts the commit instead of publishing a snapshot that was never checked.
+	requirements.push_back(make_uniq<AssertRefSnapshotId>(branch, branch_ref.snapshot_id));
+	requirements.push_back(make_uniq<AssertRefSnapshotId>(to, target_ref.snapshot_id));
+	updates.push_back(make_uniq<SetSnapshotRef>(target_ref.snapshot_id, branch));
+	modified_refs.insert(branch);
+	return result;
+}
+
+IcebergRefMove IcebergTransactionData::TableSetCurrentSnapshot(optional<int64_t> snapshot_id,
+                                                               const string &source_ref) {
+	if (snapshot_id.has_value() == !source_ref.empty()) {
+		throw InvalidInputException("Exactly one of snapshot_id and ref must be provided");
+	}
+	VerifyCanChangeRef("main");
+	auto &metadata = table_info.GetMetadata();
+
+	int64_t target_snapshot_id;
+	if (!source_ref.empty()) {
+		if (source_ref != "main" && modified_refs.count(source_ref)) {
+			throw InvalidInputException("Cannot set the current snapshot from ref '%s' of table \"%s\": it was already "
+			                            "changed in this transaction",
+			                            source_ref, table_info.name);
+		}
+		target_snapshot_id =
+		    GetExistingRef(metadata, source_ref, "Ref", "pass snapshot_id := to select a snapshot id").snapshot_id;
+	} else {
+		target_snapshot_id = *snapshot_id;
+	}
+	if (!metadata.FindSnapshotByIdInternal(target_snapshot_id)) {
+		throw InvalidInputException("Cannot set the current snapshot to unknown snapshot id: %lld", target_snapshot_id);
+	}
+
+	auto main = FindRef(metadata, "main");
+	if (main && main->type != IcebergRefType::BRANCH) {
+		throw InvalidConfigurationException("Iceberg ref 'main' of table \"%s\" is not a branch", table_info.name);
+	}
+	IcebergRefMove result;
+	result.updated_snapshot_id = target_snapshot_id;
+	optional<int64_t> expected_main;
+	if (main) {
+		result.previous_snapshot_id = main->snapshot_id;
+		expected_main = main->snapshot_id;
+	}
+	if (main && main->snapshot_id == target_snapshot_id) {
+		//! Nothing to publish, but a later change of main in this transaction would contradict the
+		//! reported result, so it counts as changed.
+		modified_refs.insert("main");
+		return result;
+	}
+	if (!source_ref.empty() && source_ref != "main") {
+		//! The source ref must still point at the snapshot we resolved it to.
+		requirements.push_back(make_uniq<AssertRefSnapshotId>(source_ref, target_snapshot_id));
+	}
+	requirements.push_back(make_uniq<AssertRefSnapshotId>("main", expected_main));
+	updates.push_back(make_uniq<SetSnapshotRef>(target_snapshot_id));
+	modified_refs.insert("main");
+	return result;
 }
 
 } // namespace duckdb

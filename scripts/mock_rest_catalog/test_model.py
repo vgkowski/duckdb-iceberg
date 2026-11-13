@@ -117,13 +117,22 @@ class SnapshotRemovalTests(unittest.TestCase):
         self.assertEqual(result["next-row-id"], 3)
         self.assertEqual(result["snapshots"][:-1], removed["snapshots"])
 
-    def test_removing_other_refs_is_unsupported_and_does_not_remove_main(self):
-        before = copy.deepcopy(self.catalog.tables[self.key])
+    def test_removing_other_refs_does_not_remove_main(self):
+        branch = {"action": "set-snapshot-ref", "ref-name": "branch", "type": "branch", "snapshot-id": 20}
+        before = self.commit([branch])["metadata"]
+        self.assertIn("branch", before["refs"])
+        result = self.commit([{"action": "remove-snapshot-ref", "ref-name": "branch"}])["metadata"]
+        self.assertNotIn("branch", result["refs"])
+        self.assertEqual(result["refs"]["main"], before["refs"]["main"])
+        self.assertEqual(result["current-snapshot-id"], 30)
+        self.assertEqual(result["snapshots"], before["snapshots"])
+        # Like Java's TableMetadata.Builder.removeRef, removing an unknown ref is a no-op.
+        self.assertEqual(
+            self.commit([{"action": "remove-snapshot-ref", "ref-name": "branch"}])["metadata"]["refs"], result["refs"]
+        )
         with self.assertRaises(CatalogError) as error:
-            self.commit([{"action": "remove-snapshot-ref", "ref-name": "branch"}])
-        self.assertEqual(error.exception.code, 501)
-        self.assertIn("Only the main branch", str(error.exception))
-        self.assertEqual(self.catalog.tables[self.key], before)
+            self.commit([{"action": "remove-snapshot-ref", "ref-name": ""}])
+        self.assertEqual(error.exception.code, 400)
 
     def test_later_invalid_update_does_not_publish_removal(self):
         before = copy.deepcopy(self.catalog.tables[self.key])
@@ -131,6 +140,53 @@ class SnapshotRemovalTests(unittest.TestCase):
             self.commit([self.removal([10]), self.ref(999)])
         self.assertEqual(error.exception.code, 400)
         self.assertIn("Unknown snapshot reference", str(error.exception))
+        self.assertEqual(self.catalog.tables[self.key], before)
+
+    def snapshot(self, identifier, sequence_number, parent=None, **extra):
+        snapshot = copy.deepcopy(self.catalog.tables[self.key]["metadata"]["snapshots"][-1])
+        snapshot.pop("parent-snapshot-id", None)
+        snapshot.update({"snapshot-id": identifier, "sequence-number": sequence_number, "timestamp-ms": identifier})
+        if parent is not None:
+            snapshot["parent-snapshot-id"] = parent
+        snapshot.update(extra)
+        return {"action": "add-snapshot", "snapshot": snapshot}
+
+    def test_add_snapshot_sequence_and_parent_checks_match_java(self):
+        # Like Java's TableMetadata.Builder.addSnapshot: a stale sequence number with a parent is a
+        # ValidationException (400) carrying Java's message.
+        before = copy.deepcopy(self.catalog.tables[self.key])
+        with self.assertRaises(CatalogError) as error:
+            self.commit([self.snapshot(40, 3, parent=30)])
+        self.assertEqual(error.exception.code, 400)
+        self.assertIn(
+            "Cannot add snapshot with sequence number 3 older than last sequence number 3", str(error.exception)
+        )
+        self.assertEqual(self.catalog.tables[self.key], before)
+        # The parent is not validated.
+        result = self.commit([self.snapshot(40, 4, parent=999)])["metadata"]
+        self.assertEqual(result["snapshots"][-1]["parent-snapshot-id"], 999)
+        # Stricter than Java on purpose: a parent-less snapshot must also raise last-sequence-number.
+        before = copy.deepcopy(self.catalog.tables[self.key])
+        with self.assertRaises(CatalogError) as error:
+            self.commit([self.snapshot(50, 4)])
+        self.assertEqual(error.exception.code, 400)
+        self.assertIn("Mock catalog refuses a sequence number 4", str(error.exception))
+        self.assertEqual(self.catalog.tables[self.key], before)
+        result = self.commit([self.snapshot(50, 5)])["metadata"]
+        self.assertEqual(result["last-sequence-number"], 5)
+
+    def test_row_id_overlap_is_a_validation_error(self):
+        self.commit(
+            [
+                {"action": "upgrade-format-version", "format-version": 3},
+                self.snapshot(40, 4, parent=30, **{"first-row-id": 0, "added-rows": 2}),
+            ]
+        )
+        before = copy.deepcopy(self.catalog.tables[self.key])
+        with self.assertRaises(CatalogError) as error:
+            self.commit([self.snapshot(50, 5, parent=40, **{"first-row-id": 1, "added-rows": 1})])
+        self.assertEqual(error.exception.code, 400)
+        self.assertIn("first-row-id is behind table next-row-id: 1 < 2", str(error.exception))
         self.assertEqual(self.catalog.tables[self.key], before)
 
     def test_malformed_snapshot_ids_do_not_publish(self):

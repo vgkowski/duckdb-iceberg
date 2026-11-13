@@ -4,6 +4,7 @@
 #include "duckdb/common/string.hpp"
 #include "duckdb/common/types.hpp"
 #include "duckdb/common/types/value.hpp"
+#include "duckdb/common/optional.hpp"
 
 #include "catalog/rest/api/iceberg_table_update.hpp"
 #include "catalog/rest/api/iceberg_table_requirement.hpp"
@@ -17,6 +18,13 @@
 namespace duckdb {
 
 struct IcebergTable;
+
+//! Optional retention fields of an Iceberg snapshot ref (unset means the table default applies).
+struct IcebergSnapshotRefRetention {
+	optional<int64_t> max_ref_age_ms;
+	optional<int64_t> max_snapshot_age_ms;
+	optional<int32_t> min_snapshots_to_keep;
+};
 
 struct AddSchemaUpdate : public IcebergTableUpdate {
 public:
@@ -60,9 +68,13 @@ struct AssertCurrentSchemaIdRequirement : public IcebergTableRequirement {
 struct AssertRefSnapshotId : public IcebergTableRequirement {
 	static constexpr const IcebergTableRequirementType TYPE = IcebergTableRequirementType::ASSERT_REF_SNAPSHOT_ID;
 
+	//! Requires 'main' to point at 'snapshot_id', or not to exist when 'snapshot_id' is empty.
 	explicit AssertRefSnapshotId(optional<int64_t> snapshot_id);
+	//! Requires 'ref_name' to point at 'snapshot_id', or not to exist when 'snapshot_id' is empty.
+	AssertRefSnapshotId(string ref_name, optional<int64_t> snapshot_id);
 	void CreateRequirement(DatabaseInstance &db, ClientContext &context, IcebergCommitState &commit_state);
 
+	string ref_name;
 	optional<int64_t> snapshot_id;
 };
 
@@ -201,20 +213,36 @@ struct SetLocation : public IcebergTableUpdate {
 struct SetSnapshotRef : public IcebergTableUpdate {
 	static constexpr const IcebergTableUpdateType TYPE = IcebergTableUpdateType::SET_SNAPSHOT_REF;
 
+	//! Points an existing branch at 'snapshot_id', preserving its retention policy (or creates the branch).
 	explicit SetSnapshotRef(int64_t snapshot_id, string ref_name = "main");
 	void CreateUpdate(DatabaseInstance &db, ClientContext &context, IcebergCommitState &commit_state) const override;
 
+	//! Creates a new branch or tag with the given retention policy, ignoring any ref of that name.
+	static unique_ptr<SetSnapshotRef> CreateRef(int64_t snapshot_id, string ref_name, string ref_type,
+	                                            const IcebergSnapshotRefRetention &retention);
+
 	int64_t snapshot_id;
 	string ref_name;
+	//! Set for a newly created ref; the update then carries exactly this type and retention.
+	bool creates_ref = false;
+	string ref_type = "branch";
+	IcebergSnapshotRefRetention retention;
 };
 
 struct RemoveSnapshotRef : public IcebergTableUpdate {
 	static constexpr const IcebergTableUpdateType TYPE = IcebergTableUpdateType::REMOVE_SNAPSHOT_REF;
 
+	//! Removes a ref other than main; removing main through this constructor is an internal error.
 	explicit RemoveSnapshotRef(string ref_name);
+	//! Removes main. Only for table replacement (TableReplaceContents), whose commit asserts main.
+	static unique_ptr<RemoveSnapshotRef> DetachMain();
 	void CreateUpdate(DatabaseInstance &db, ClientContext &context, IcebergCommitState &commit_state) const override;
 
 	string ref_name;
+
+private:
+	struct DetachMainTag {};
+	explicit RemoveSnapshotRef(DetachMainTag);
 };
 
 } // namespace duckdb

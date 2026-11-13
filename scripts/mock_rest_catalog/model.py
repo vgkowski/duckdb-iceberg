@@ -23,6 +23,21 @@ def unsupported(message):
     raise CatalogError(501, "UnsupportedOperationException", message)
 
 
+def validate_ref_retention(ref):
+    # Mirrors Java's SnapshotRef builder: retention values are positive integers, and only
+    # branches keep snapshots, so tags refuse the snapshot-retention fields.
+    for field in ("min-snapshots-to-keep", "max-snapshot-age-ms", "max-ref-age-ms"):
+        if field not in ref or ref[field] is None:
+            continue
+        value = ref[field]
+        if isinstance(value, bool) or not isinstance(value, int) or value <= 0:
+            invalid(f"Snapshot reference {field} must be a positive integer")
+        if value > (2**31 - 1 if field == "min-snapshots-to-keep" else 2**63 - 1):
+            invalid(f"Snapshot reference {field} is out of range")
+        if ref["type"] == "tag" and field != "max-ref-age-ms":
+            invalid(f"Tags do not support {field}")
+
+
 def namespace_parts(value):
     if not isinstance(value, list) or not value or any(not isinstance(part, str) or not part for part in value):
         invalid("Namespace must contain nonempty strings")
@@ -282,6 +297,15 @@ class Catalog:
         if kind == "assert-create":
             valid = metadata is None
         elif kind == "assert-ref-snapshot-id":
+            # The REST spec requires snapshot-id; only an explicit null means "the ref must not exist"
+            # (apache-iceberg-1.10.0, open-api/rest-catalog-open-api.yaml:3138-3157). This mock is
+            # stricter than Java's server-side parser, which reads a missing snapshot-id as null
+            # (core/src/main/java/org/apache/iceberg/UpdateRequirementParser.java:253, JsonUtil.getLongOrNull).
+            # The client always sends an explicit null, so the strictness masks nothing.
+            if "snapshot-id" not in requirement:
+                invalid("assert-ref-snapshot-id requires snapshot-id")
+            if not isinstance(requirement.get("ref"), str):
+                invalid("assert-ref-snapshot-id requires a ref name")
             actual = metadata["refs"].get(requirement["ref"], {}).get("snapshot-id") if metadata else None
             valid = metadata is not None and actual == requirement.get("snapshot-id")
         elif kind in fields:
@@ -424,12 +448,26 @@ class Catalog:
             identifier = snapshot["snapshot-id"]
             if any(s["snapshot-id"] == identifier for s in metadata["snapshots"]):
                 invalid("Snapshot ID already exists")
-            if snapshot["sequence-number"] <= metadata["last-sequence-number"]:
-                invalid("Snapshot sequence number must increase")
-            if snapshot.get("parent-snapshot-id") is not None and not any(
-                s["snapshot-id"] == snapshot["parent-snapshot-id"] for s in metadata["snapshots"]
-            ):
-                invalid("Unknown parent snapshot")
+            # Server-side model of Java's TableMetadata.Builder.addSnapshot (apache-iceberg-1.10.0,
+            # core/src/main/java/org/apache/iceberg/TableMetadata.java:1232-1259): a snapshot with a parent
+            # must exceed last-sequence-number (400 with Java's message), and the parent snapshot is not
+            # validated.
+            sequence_number = snapshot["sequence-number"]
+            last_sequence_number = metadata["last-sequence-number"]
+            if sequence_number <= last_sequence_number:
+                if snapshot.get("parent-snapshot-id") is not None:
+                    invalid(
+                        f"Cannot add snapshot with sequence number {sequence_number} "
+                        f"older than last sequence number {last_sequence_number}"
+                    )
+                # Stricter than Java on purpose: Java exempts a parent-less snapshot (and any v1 snapshot)
+                # and adopts its sequence number as last-sequence-number, which can lower it. A client that
+                # stamped such a snapshot from stale metadata would make later deletes miss newer data files;
+                # refusing it here makes the tests catch that client bug.
+                invalid(
+                    f"Mock catalog refuses a sequence number {sequence_number} "
+                    f"that is not above last-sequence-number {last_sequence_number}"
+                )
             if not any(s["schema-id"] == snapshot["schema-id"] for s in metadata["schemas"]):
                 invalid("Unknown snapshot schema")
             # DuckDB writes the data/delete files and manifest list for every operation.
@@ -443,7 +481,12 @@ class Catalog:
                 first = row_id_value(snapshot.get("first-row-id"), "first-row-id")
                 added = row_id_value(snapshot.get("added-rows"), "added-rows")
                 if first < metadata["next-row-id"]:
-                    raise CatalogError(409, "CommitFailedException", "Snapshot row IDs overlap a committed allocation")
+                    # Java rejects this with a ValidationException (HTTP 400), not a commit conflict
+                    # (TableMetadata.java:1264-1273 at apache-iceberg-1.10.0, server-side).
+                    invalid(
+                        f"Cannot add a snapshot, first-row-id is behind table next-row-id: "
+                        f"{first} < {metadata['next-row-id']}"
+                    )
                 # Reserve gaps too: upgrading writers may assign IDs to carried-forward
                 # v2 manifests before the new data. Never lower this cursor on rollback.
                 metadata["next-row-id"] = row_id_value(first + added, "next-row-id")
@@ -456,9 +499,17 @@ class Catalog:
             identifier = update["snapshot-id"]
             if not any(s["snapshot-id"] == identifier for s in metadata["snapshots"]):
                 invalid("Unknown snapshot reference")
-            if update["ref-name"] != "main" or update["type"] != "branch":
-                unsupported("Only the main branch is implemented")
-            metadata["refs"]["main"] = {k: v for k, v in update.items() if k not in ("action", "ref-name")}
+            ref_name = update.get("ref-name")
+            if not isinstance(ref_name, str) or not ref_name or update.get("type") not in ("branch", "tag"):
+                invalid("Invalid snapshot reference")
+            # Stricter than Java's server (TableMetadata.Builder.setRef does not check this), on purpose
+            if ref_name == "main" and update["type"] != "branch":
+                invalid("The main ref must be a branch")
+            validate_ref_retention(update)
+            metadata["refs"][ref_name] = {k: v for k, v in update.items() if k not in ("action", "ref-name")}
+            if ref_name != "main":
+                # Only main determines the current snapshot and its history.
+                return
             if metadata.get("current-snapshot-id") != identifier:
                 # New snapshots are addressable at their own timestamps. Moving main
                 # back to an existing snapshot is a new history event, not a rewrite
@@ -469,9 +520,14 @@ class Catalog:
                 metadata["snapshot-log"].append({"snapshot-id": identifier, "timestamp-ms": timestamp})
                 metadata["current-snapshot-id"] = identifier
         elif action == "remove-snapshot-ref":
-            if update["ref-name"] != "main":
-                unsupported("Only the main branch is implemented")
-            metadata["refs"].pop("main", None)
-            metadata.pop("current-snapshot-id", None)
+            ref_name = update.get("ref-name")
+            if not isinstance(ref_name, str) or not ref_name:
+                invalid("remove-snapshot-ref requires a ref name")
+            # Server-side model of Java's TableMetadata.Builder.removeRef (core/.../TableMetadata.java:1342-1353
+            # at apache-iceberg-1.10.0): removing main also clears the current snapshot, and removing an
+            # unknown ref is a no-op; a concurrent drop is caught by the requirements, checked first.
+            metadata["refs"].pop(ref_name, None)
+            if ref_name == "main":
+                metadata.pop("current-snapshot-id", None)
         else:
             invalid(f"Unknown update action: {action}")

@@ -1,5 +1,6 @@
 #include "catalog/rest/api/table_update.hpp"
 #include "duckdb/common/exception.hpp"
+#include "duckdb/common/string_util.hpp"
 #include "catalog/rest/iceberg_table_set.hpp"
 
 #include <algorithm>
@@ -83,7 +84,16 @@ void AssertCurrentSchemaIdRequirement::CreateRequirement(DatabaseInstance &db, C
 }
 
 AssertRefSnapshotId::AssertRefSnapshotId(optional<int64_t> snapshot_id)
-    : IcebergTableRequirement(IcebergTableRequirementType::ASSERT_REF_SNAPSHOT_ID), snapshot_id(snapshot_id) {
+    : IcebergTableRequirement(IcebergTableRequirementType::ASSERT_REF_SNAPSHOT_ID), ref_name("main"),
+      snapshot_id(std::move(snapshot_id)) {
+}
+
+AssertRefSnapshotId::AssertRefSnapshotId(string ref_name_p, optional<int64_t> snapshot_id_p)
+    : IcebergTableRequirement(IcebergTableRequirementType::ASSERT_REF_SNAPSHOT_ID), ref_name(std::move(ref_name_p)),
+      snapshot_id(std::move(snapshot_id_p)) {
+	if (ref_name.empty()) {
+		throw InternalException("(AssertRefSnapshotId) Missing ref name");
+	}
 }
 
 void AssertRefSnapshotId::CreateRequirement(DatabaseInstance &db, ClientContext &context,
@@ -92,8 +102,11 @@ void AssertRefSnapshotId::CreateRequirement(DatabaseInstance &db, ClientContext 
 	auto &req = commit_state.table_change.requirements.back();
 	req.assert_ref_snapshot_id = rest_api_objects::AssertRefSnapshotId();
 	req.assert_ref_snapshot_id->type = "assert-ref-snapshot-id";
-	req.assert_ref_snapshot_id->ref = "main";
-	req.assert_ref_snapshot_id->snapshot_id = snapshot_id;
+	req.assert_ref_snapshot_id->ref = ref_name;
+	//! An empty snapshot id serializes as null, which requires the ref not to exist.
+	if (snapshot_id) {
+		req.assert_ref_snapshot_id->snapshot_id = *snapshot_id;
+	}
 }
 
 AssertLastAssignedFieldIdRequirement::AssertLastAssignedFieldIdRequirement(int32_t last_assigned_field_id)
@@ -308,19 +321,69 @@ void SetSnapshotRef::CreateUpdate(DatabaseInstance &db, ClientContext &context,
 	req.set_snapshot_ref_update->base_update.action = "set-snapshot-ref";
 	req.set_snapshot_ref_update->ref_name = ref_name;
 	auto &snapshot_reference = req.set_snapshot_ref_update->snapshot_reference;
-	snapshot_reference.type = "branch";
-	auto &refs = commit_state.GetTableMetadata().refs;
-	if (refs) {
-		auto entry = refs->additional_properties.find(ref_name);
-		if (entry != refs->additional_properties.end()) {
-			// Updating the snapshot ID must preserve the reference's retention policy.
-			snapshot_reference = entry->second.Copy();
+	snapshot_reference.type = ref_type;
+	if (creates_ref) {
+		//! A new ref carries exactly the requested policy; an existing ref of that name fails the
+		//! accompanying assert-ref-snapshot-id requirement rather than lending us its retention.
+		snapshot_reference.max_ref_age_ms = retention.max_ref_age_ms;
+		snapshot_reference.max_snapshot_age_ms = retention.max_snapshot_age_ms;
+		snapshot_reference.min_snapshots_to_keep = retention.min_snapshots_to_keep;
+	} else {
+		auto &refs = commit_state.GetTableMetadata().refs;
+		if (refs) {
+			auto entry = refs->additional_properties.find(ref_name);
+			if (entry != refs->additional_properties.end()) {
+				// Updating the snapshot ID must preserve the reference's retention policy.
+				snapshot_reference = entry->second.Copy();
+				//! Refs are read case-insensitively, but catalogs expect the spec's lowercase type.
+				snapshot_reference.type = StringUtil::Lower(snapshot_reference.type);
+				//! Every move (INSERT/DELETE publishing to main, rollback, fast_forward, set_current_snapshot)
+				//! moves a branch. Java's client refuses to move a tag ("Cannot update branch: %s is a tag",
+				//! apache-iceberg-1.10.0, core/src/main/java/org/apache/iceberg/TableMetadata.java:1756, reached via
+				//! setBranchSnapshot). Java's server applies set-snapshot-ref through Builder.setRef
+				//! (TableMetadata.java:1306-1340, via MetadataUpdate.java:418-425), which does not check this, so the
+				//! client must refuse instead of sending set-snapshot-ref with type tag.
+				if (snapshot_reference.type != "branch") {
+					throw InvalidConfigurationException(
+					    "Cannot move Iceberg ref '%s' of table \"%s\": it is not a branch", ref_name,
+					    commit_state.table_info.name);
+				}
+			}
 		}
 	}
 	snapshot_reference.snapshot_id = snapshot_id;
 }
 
-RemoveSnapshotRef::RemoveSnapshotRef(string ref_name_p) : IcebergTableUpdate(TYPE), ref_name(std::move(ref_name_p)) {
+unique_ptr<SetSnapshotRef> SetSnapshotRef::CreateRef(int64_t snapshot_id, string ref_name, string ref_type,
+                                                     const IcebergSnapshotRefRetention &retention) {
+	if (ref_type != "branch" && ref_type != "tag") {
+		throw InternalException("(SetSnapshotRef) Unknown ref type '%s'", ref_type);
+	}
+	auto result = make_uniq<SetSnapshotRef>(snapshot_id, std::move(ref_name));
+	result->creates_ref = true;
+	result->ref_type = std::move(ref_type);
+	result->retention = retention;
+	return result;
+}
+
+RemoveSnapshotRef::RemoveSnapshotRef(string ref_name_p)
+    : IcebergTableUpdate(IcebergTableUpdateType::REMOVE_SNAPSHOT_REF), ref_name(std::move(ref_name_p)) {
+	if (ref_name.empty()) {
+		throw InternalException("(RemoveSnapshotRef) Missing ref name");
+	}
+	//! Only table replacement may remove main, through DetachMain(). User-facing ref drops also refuse main
+	//! before creating this update (TableDropRef).
+	if (ref_name == "main") {
+		throw InternalException("(RemoveSnapshotRef) Removing main requires RemoveSnapshotRef::DetachMain()");
+	}
+}
+
+RemoveSnapshotRef::RemoveSnapshotRef(DetachMainTag)
+    : IcebergTableUpdate(IcebergTableUpdateType::REMOVE_SNAPSHOT_REF), ref_name("main") {
+}
+
+unique_ptr<RemoveSnapshotRef> RemoveSnapshotRef::DetachMain() {
+	return unique_ptr<RemoveSnapshotRef>(new RemoveSnapshotRef(DetachMainTag()));
 }
 
 void RemoveSnapshotRef::CreateUpdate(DatabaseInstance &db, ClientContext &context,

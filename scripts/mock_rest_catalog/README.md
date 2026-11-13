@@ -97,6 +97,12 @@ without changing historical snapshots or their files. New v3 snapshots must carr
 nonnegative 64-bit `first-row-id` and `added-rows` values, and their allocations
 must not overlap previously reserved IDs. The cursor advances past the complete
 reserved range, including gaps, and is retained across snapshot rollback.
+Like Java's server-side `TableMetadata.Builder.addSnapshot` (apache-iceberg-1.10.0,
+`TableMetadata.java:1232-1273`), `add-snapshot` does not validate the parent snapshot
+and answers a stale sequence number or an overlapping `first-row-id` with HTTP 400 and
+Java's messages. Unlike Java, it also requires a parent-less snapshot to raise
+`last-sequence-number` (Java exempts it and can lower the counter), so a client that
+stamps such a snapshot from stale metadata fails the tests.
 Downgrades are rejected. V3 schemas retain defaults and extended types; v2 schemas
 reject v3-only types and non-null defaults. Schema field IDs are collected only
 from type definitions, never from default values. Initial field IDs are preserved

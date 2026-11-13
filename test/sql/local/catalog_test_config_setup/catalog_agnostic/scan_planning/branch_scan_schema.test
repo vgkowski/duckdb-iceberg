@@ -1,0 +1,78 @@
+# name: test/sql/local/catalog_test_config_setup/catalog_agnostic/scan_planning/branch_scan_schema.test
+# description: A branch on an older snapshot reads with the table's current schema, a tag with its snapshot's schema
+# group: [scan_planning]
+
+# Iceberg docs branching.md, "Schema selection with branches and tags". With server-side scan planning (the
+# fixture-latest config) this guards the plan request's use-snapshot-schema flag, which is false for a branch.
+
+require-env CATALOG_TEST_CONFIG_SETUP
+
+require-env TIMETRAVEL_SUPPORT
+
+include test/sql/init_requires
+
+statement ok
+drop table if exists my_datalake.default.branch_scan_schema;
+
+statement ok
+create table my_datalake.default.branch_scan_schema (id INTEGER);
+
+statement ok
+insert into my_datalake.default.branch_scan_schema values (1), (2);
+
+statement ok
+set variable old_snapshot = (select snapshot_id::BIGINT from iceberg_snapshots(my_datalake.default.branch_scan_schema) order by sequence_number desc limit 1);
+
+statement ok
+alter table my_datalake.default.branch_scan_schema add column extra VARCHAR;
+
+statement ok
+insert into my_datalake.default.branch_scan_schema values (3, 'c');
+
+query TT
+select ref_name, ref_type from iceberg_create_branch('my_datalake.default.branch_scan_schema', 'audit', snapshot_id := getvariable('old_snapshot'));
+----
+audit	branch
+
+query TT
+select ref_name, ref_type from iceberg_create_tag('my_datalake.default.branch_scan_schema', 'v1', snapshot_id := getvariable('old_snapshot'));
+----
+v1	tag
+
+# main: the new snapshot with the current schema
+query III
+select count(*), count(extra), sum(id) from my_datalake.default.branch_scan_schema;
+----
+3	1	6
+
+# The branch reads the old snapshot with the current schema: 'extra' exists and is NULL
+query III
+select count(*), count(extra), sum(id) from my_datalake.default.branch_scan_schema AT (VERSION => 'audit');
+----
+2	0	3
+
+query I
+select string_agg(column_name, ',' order by column_name)
+from (describe select * from my_datalake.default.branch_scan_schema AT (VERSION => 'audit'));
+----
+extra,id
+
+# The tag reads the old snapshot with that snapshot's schema: no 'extra'
+query II
+select count(*), sum(id) from my_datalake.default.branch_scan_schema AT (VERSION => 'v1');
+----
+2	3
+
+query I
+select string_agg(column_name, ',' order by column_name)
+from (describe select * from my_datalake.default.branch_scan_schema AT (VERSION => 'v1'));
+----
+id
+
+statement error
+select extra from my_datalake.default.branch_scan_schema AT (VERSION => 'v1');
+----
+Referenced column "extra" not found
+
+statement ok
+drop table my_datalake.default.branch_scan_schema;

@@ -397,6 +397,14 @@ void Catalog::CheckRequirement(const Json &metadata, const Json &requirement) co
 	if (kind == "assert-create") {
 		valid = metadata.IsNull();
 	} else if (kind == "assert-ref-snapshot-id") {
+		//! The REST spec requires snapshot-id; only an explicit null means "the ref must not exist"
+		//! (apache-iceberg-1.10.0, open-api/rest-catalog-open-api.yaml:3138-3157). This mock is stricter than
+		//! Java's server-side parser, which reads a missing snapshot-id as null
+		//! (core/src/main/java/org/apache/iceberg/UpdateRequirementParser.java:253, JsonUtil.getLongOrNull).
+		//! The client always sends an explicit null, so the strictness masks nothing.
+		if (!requirement.Has("snapshot-id")) {
+			Invalid("assert-ref-snapshot-id requires snapshot-id");
+		}
 		if (!metadata.IsNull()) {
 			auto &ref = metadata.At("refs").Get(requirement.At("ref").String());
 			valid = ref.Get("snapshot-id") == requirement.Get("snapshot-id");
@@ -608,29 +616,43 @@ void Catalog::Apply(Json &metadata, const Json &update, map<string, int64_t> &la
 		auto identifier = update.At("snapshot-id").Integer();
 		auto &snapshot = FindID(metadata.At("snapshots"), "snapshot-id", identifier);
 		auto ref_name = update.At("ref-name").String();
-		auto ref_type = update.At("type").String();
-		if (ref_type != "branch" && ref_type != "tag") {
-			Invalid("Unknown snapshot ref type: " + ref_type);
+		auto type = update.At("type").String();
+		if (ref_name.empty()) {
+			Invalid("Invalid snapshot reference");
 		}
-		if (ref_type == "tag" && (update.Has("min-snapshots-to-keep") || update.Has("max-snapshot-age-ms"))) {
-			// As Java's SnapshotRef.Builder: these retention fields only apply to branches
-			Invalid("Tags do not support min-snapshots-to-keep or max-snapshot-age-ms");
+		if (type != "branch" && type != "tag") {
+			Invalid("Unknown snapshot ref type: " + type);
 		}
-		if (ref_name != "main") {
-			// Other refs only point at a snapshot; they never move current-snapshot-id or the snapshot-log
-			auto ref = update;
-			ref.Erase("action");
-			ref.Erase("ref-name");
-			metadata.At("refs")[ref_name] = std::move(ref);
-			return;
-		}
-		if (ref_type != "branch") {
+		// Stricter than Java's server (TableMetadata.Builder.setRef does not check this), on purpose
+		if (ref_name == "main" && type != "branch") {
 			Invalid("The main ref must be a branch");
+		}
+		// Mirrors Java's SnapshotRef builder: retention values are positive integers, and only
+		// branches keep snapshots, so tags refuse the snapshot-retention fields.
+		for (auto field : {"min-snapshots-to-keep", "max-snapshot-age-ms", "max-ref-age-ms"}) {
+			auto &value = update.Get(field);
+			if (value.IsNull()) {
+				continue;
+			}
+			auto number = value.Integer();
+			if (number <= 0) {
+				Invalid(string("Snapshot reference ") + field + " must be a positive integer");
+			}
+			if (string(field) == "min-snapshots-to-keep" && number > NumericLimits<int32_t>::Maximum()) {
+				Invalid(string("Snapshot reference ") + field + " is out of range");
+			}
+			if (type == "tag" && string(field) != "max-ref-age-ms") {
+				Invalid(string("Tags do not support ") + field);
+			}
 		}
 		auto ref = update;
 		ref.Erase("action");
 		ref.Erase("ref-name");
-		metadata.At("refs")["main"] = std::move(ref);
+		metadata.At("refs")[ref_name] = std::move(ref);
+		if (ref_name != "main") {
+			// Only main determines the current snapshot and its history.
+			return;
+		}
 		if (metadata.Get("current-snapshot-id") != update.At("snapshot-id")) {
 			// Publication waits for this tick before exposing the candidate.
 			auto timestamp = MaxValue(NowMillis(), request_start_ms + 1);
@@ -666,11 +688,17 @@ void Catalog::Apply(Json &metadata, const Json &update, map<string, int64_t> &la
 			    files.end());
 		}
 	} else if (action == "remove-snapshot-ref") {
-		if (update.At("ref-name").String() != "main") {
-			Unsupported("Only the main branch is implemented");
+		if (!update.Has("ref-name") || update.At("ref-name").String().empty()) {
+			Invalid("Invalid snapshot reference");
 		}
-		metadata.At("refs").Erase("main");
-		metadata.Erase("current-snapshot-id");
+		auto ref_name = update.At("ref-name").String();
+		// Server-side model of Java's TableMetadata.Builder.removeRef (core/.../TableMetadata.java:1342-1353 at
+		// apache-iceberg-1.10.0): removing main also clears the current snapshot, and removing an unknown ref is a
+		// no-op; a concurrent drop is caught by the requirements, which are checked before any update is applied.
+		metadata.At("refs").Erase(ref_name);
+		if (ref_name == "main") {
+			metadata.Erase("current-snapshot-id");
+		}
 	} else {
 		Invalid("Unknown update action: " + action);
 	}

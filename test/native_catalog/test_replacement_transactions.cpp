@@ -262,6 +262,33 @@ TEST_CASE("Replacement rejects earlier data changes and rollback without changin
 	CheckRows(test.connection, expected);
 }
 
+TEST_CASE("Replacement rejects earlier snapshot expiration without changing transaction state",
+          "[iceberg_replacement]") {
+	ReplacementTest test;
+	Query(test.connection, "INSERT INTO lake.default.t VALUES (3)");
+	Query(test.connection, "BEGIN");
+	auto &table = test.WritableTable();
+	auto &data = *table.transaction_data;
+	// Stage what iceberg_expire_snapshots stages (this binary lacks list literals for its snapshot_ids argument).
+	auto old_snapshot = Scalar(test.connection, "SELECT getvariable('old_snapshot')").GetValue<int64_t>();
+	data.updates.push_back(make_uniq<RemoveSnapshots>(vector<int64_t> {old_snapshot}));
+	auto before = table.GetMetadataMutable().ToJSON();
+	auto update_count = data.updates.size();
+	REQUIRE_THROWS_WITH(test.Replace(),
+	                    Catch::Contains("Table replacement cannot be combined with snapshot expiration"));
+	REQUIRE(table.GetMetadata().ToJSON() == before);
+	REQUIRE(data.updates.size() == update_count);
+	REQUIRE_FALSE(data.replaces_table);
+	Query(test.connection, "ROLLBACK");
+	CheckRows(test.connection, {1, 2, 3});
+}
+
+TEST_CASE("Only DetachMain removes main", "[iceberg_replacement]") {
+	REQUIRE_THROWS_WITH(RemoveSnapshotRef("main"), Catch::Contains("DetachMain"));
+	REQUIRE(RemoveSnapshotRef("audit").ref_name == "audit");
+	REQUIRE(RemoveSnapshotRef::DetachMain()->ref_name == "main");
+}
+
 TEST_CASE("Replacement supports updates and deletes of its new rows", "[iceberg_replacement]") {
 	for (auto version : {2, 3}) {
 		CAPTURE(version);

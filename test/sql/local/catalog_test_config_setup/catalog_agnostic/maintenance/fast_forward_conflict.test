@@ -1,0 +1,319 @@
+# name: test/sql/local/catalog_test_config_setup/catalog_agnostic/maintenance/fast_forward_conflict.test
+# description: A concurrent change to either ref aborts iceberg_fast_forward instead of publishing an unvalidated snapshot
+# group: [maintenance]
+
+require-env CATALOG_TEST_CONFIG_SETUP
+
+require-env TIMETRAVEL_SUPPORT
+
+include test/sql/init_requires
+
+statement ok
+drop table if exists my_datalake.default.fast_forward_conflict;
+
+statement ok
+create table my_datalake.default.fast_forward_conflict (id INTEGER);
+
+statement ok
+insert into my_datalake.default.fast_forward_conflict values (1);
+
+statement ok
+set variable s1 = (select snapshot_id::BIGINT from iceberg_snapshots(my_datalake.default.fast_forward_conflict) order by sequence_number desc limit 1);
+
+statement ok
+insert into my_datalake.default.fast_forward_conflict values (2);
+
+statement ok
+select * from iceberg_create_branch('my_datalake.default.fast_forward_conflict', 'audit');
+
+statement ok
+select * from iceberg_rollback_to_snapshot('my_datalake.default.fast_forward_conflict', getvariable('s1'));
+
+# 1. main moves concurrently: the validated base is stale, so nothing is published
+statement ok con1
+BEGIN;
+
+statement ok con1
+select * from iceberg_fast_forward('my_datalake.default.fast_forward_conflict', 'main', 'audit');
+
+statement ok con2
+insert into my_datalake.default.fast_forward_conflict values (3);
+
+statement error con1
+COMMIT;
+----
+<REGEX>:.*Failed to commit Iceberg transaction.*409.*
+
+query I
+select list(id order by id) from my_datalake.default.fast_forward_conflict;
+----
+[1, 3]
+
+query I
+select list(id order by id) from my_datalake.default.fast_forward_conflict AT (VERSION => 'audit');
+----
+[1, 2]
+
+# Reset main to the base of audit
+statement ok
+select * from iceberg_rollback_to_snapshot('my_datalake.default.fast_forward_conflict', getvariable('s1'));
+
+# 2. The source ref moves concurrently: the snapshot it now points at was never validated
+statement ok con1
+BEGIN;
+
+statement ok con1
+select * from iceberg_fast_forward('my_datalake.default.fast_forward_conflict', 'main', 'audit');
+
+statement ok con2
+select * from iceberg_drop_branch('my_datalake.default.fast_forward_conflict', 'audit');
+
+statement ok con2
+set variable s1 = (select snapshot_id from iceberg_snapshots(my_datalake.default.fast_forward_conflict) order by sequence_number limit 1);
+
+statement ok con2
+select * from iceberg_create_branch('my_datalake.default.fast_forward_conflict', 'audit', snapshot_id := getvariable('s1'));
+
+statement error con1
+COMMIT;
+----
+<REGEX>:.*Failed to commit Iceberg transaction.*409.*
+
+query I
+select list(id order by id) from my_datalake.default.fast_forward_conflict;
+----
+[1]
+
+query TT
+select name, snapshot_id = getvariable('s1') from iceberg_refs(my_datalake.default.fast_forward_conflict) order by name;
+----
+audit	true
+main	true
+
+# 3. A concurrent create of the same ref aborts the second create
+statement ok con1
+BEGIN;
+
+statement ok con1
+select * from iceberg_create_tag('my_datalake.default.fast_forward_conflict', 'release');
+
+statement ok con2
+select * from iceberg_create_branch('my_datalake.default.fast_forward_conflict', 'release');
+
+statement error con1
+COMMIT;
+----
+<REGEX>:.*Failed to commit Iceberg transaction.*409.*
+
+query T
+select type from iceberg_refs(my_datalake.default.fast_forward_conflict) where name = 'release';
+----
+BRANCH
+
+# 4. A concurrent move aborts a drop
+statement ok con1
+BEGIN;
+
+statement ok con1
+select * from iceberg_drop_branch('my_datalake.default.fast_forward_conflict', 'release');
+
+statement ok con2
+insert into my_datalake.default.fast_forward_conflict values (4);
+
+statement ok con2
+select * from iceberg_fast_forward('my_datalake.default.fast_forward_conflict', 'release', 'main');
+
+statement error con1
+COMMIT;
+----
+<REGEX>:.*Failed to commit Iceberg transaction.*409.*
+
+query I
+select list(id order by id) from my_datalake.default.fast_forward_conflict AT (VERSION => 'release');
+----
+[1, 4]
+
+# 5. A ref created at the current snapshot aborts when main moves concurrently
+statement ok con1
+BEGIN;
+
+statement ok con1
+select * from iceberg_create_branch('my_datalake.default.fast_forward_conflict', 'from_main');
+
+statement ok con2
+insert into my_datalake.default.fast_forward_conflict values (5);
+
+statement error con1
+COMMIT;
+----
+<REGEX>:.*Failed to commit Iceberg transaction.*409.*
+
+query I
+select count(*) from iceberg_refs(my_datalake.default.fast_forward_conflict) where name = 'from_main';
+----
+0
+
+# 6. A concurrent move of a tag aborts its drop
+statement ok
+set variable s_main = (select snapshot_id from iceberg_refs(my_datalake.default.fast_forward_conflict) where name = 'main');
+
+statement ok
+set variable s_first = (select snapshot_id from iceberg_snapshots(my_datalake.default.fast_forward_conflict) order by sequence_number limit 1);
+
+statement ok
+select * from iceberg_create_tag('my_datalake.default.fast_forward_conflict', 'stable', snapshot_id := getvariable('s_first'));
+
+statement ok con1
+BEGIN;
+
+statement ok con1
+select * from iceberg_drop_tag('my_datalake.default.fast_forward_conflict', 'stable');
+
+statement ok con2
+select * from iceberg_drop_tag('my_datalake.default.fast_forward_conflict', 'stable');
+
+statement ok con2
+set variable s_main = (select snapshot_id from iceberg_refs(my_datalake.default.fast_forward_conflict) where name = 'main');
+
+statement ok con2
+select * from iceberg_create_tag('my_datalake.default.fast_forward_conflict', 'stable', snapshot_id := getvariable('s_main'));
+
+statement error con1
+COMMIT;
+----
+<REGEX>:.*Failed to commit Iceberg transaction.*409.*
+
+query T
+select snapshot_id = getvariable('s_main') from iceberg_refs(my_datalake.default.fast_forward_conflict) where name = 'stable';
+----
+true
+
+# 7. set_current_snapshot aborts when main moves concurrently
+statement ok con1
+set variable s_first = (select snapshot_id from iceberg_snapshots(my_datalake.default.fast_forward_conflict) order by sequence_number limit 1);
+
+statement ok con1
+BEGIN;
+
+statement ok con1
+select * from iceberg_set_current_snapshot('my_datalake.default.fast_forward_conflict', snapshot_id := getvariable('s_first'));
+
+statement ok con2
+insert into my_datalake.default.fast_forward_conflict values (6);
+
+statement error con1
+COMMIT;
+----
+<REGEX>:.*Failed to commit Iceberg transaction.*409.*
+
+query I
+select list(id order by id) from my_datalake.default.fast_forward_conflict;
+----
+[1, 4, 5, 6]
+
+# 8. set_current_snapshot from a ref aborts when that ref moves concurrently, even if main did not
+statement ok
+select * from iceberg_create_branch('my_datalake.default.fast_forward_conflict', 'source', snapshot_id := getvariable('s_first'));
+
+statement ok con1
+BEGIN;
+
+statement ok con1
+select * from iceberg_set_current_snapshot('my_datalake.default.fast_forward_conflict', ref := 'source');
+
+statement ok con2
+select * from iceberg_fast_forward('my_datalake.default.fast_forward_conflict', 'source', 'main');
+
+statement error con1
+COMMIT;
+----
+<REGEX>:.*Failed to commit Iceberg transaction.*409.*
+
+query I
+select list(id order by id) from my_datalake.default.fast_forward_conflict;
+----
+[1, 4, 5, 6]
+
+query I
+select list(id order by id) from my_datalake.default.fast_forward_conflict AT (VERSION => 'source');
+----
+[1, 4, 5, 6]
+
+# 9. A concurrent drop of the same ref aborts the second drop
+statement ok
+select * from iceberg_create_branch('my_datalake.default.fast_forward_conflict', 'dropped_twice');
+
+statement ok con1
+BEGIN;
+
+statement ok con1
+select * from iceberg_drop_branch('my_datalake.default.fast_forward_conflict', 'dropped_twice');
+
+statement ok con2
+select * from iceberg_drop_branch('my_datalake.default.fast_forward_conflict', 'dropped_twice');
+
+statement error con1
+COMMIT;
+----
+<REGEX>:.*Failed to commit Iceberg transaction.*409.*
+
+query I
+select count(*) from iceberg_refs(my_datalake.default.fast_forward_conflict) where name = 'dropped_twice';
+----
+0
+
+query I
+select list(id order by id) from my_datalake.default.fast_forward_conflict;
+----
+[1, 4, 5, 6]
+
+# 10. fast_forward creating a missing branch aborts when the branch is created concurrently
+statement ok con1
+BEGIN;
+
+statement ok con1
+select * from iceberg_fast_forward('my_datalake.default.fast_forward_conflict', 'ff_created', 'main');
+
+statement ok
+select * from iceberg_create_branch('my_datalake.default.fast_forward_conflict', 'ff_created', snapshot_id := getvariable('s_first'));
+
+statement error con1
+COMMIT;
+----
+<REGEX>:.*Failed to commit Iceberg transaction.*409.*
+
+query T
+select snapshot_id = getvariable('s_first') from iceberg_refs(my_datalake.default.fast_forward_conflict) where name = 'ff_created';
+----
+true
+
+# 11. ... and when its target moves concurrently, so it is never created at an unvalidated snapshot
+statement ok
+select * from iceberg_create_branch('my_datalake.default.fast_forward_conflict', 'ff_target', snapshot_id := getvariable('s_first'));
+
+statement ok con1
+BEGIN;
+
+statement ok con1
+select * from iceberg_fast_forward('my_datalake.default.fast_forward_conflict', 'ff_new', 'ff_target');
+
+statement ok con2
+select * from iceberg_fast_forward('my_datalake.default.fast_forward_conflict', 'ff_target', 'main');
+
+statement error con1
+COMMIT;
+----
+<REGEX>:.*Failed to commit Iceberg transaction.*409.*
+
+query I
+select count(*) from iceberg_refs(my_datalake.default.fast_forward_conflict) where name = 'ff_new';
+----
+0
+
+query I
+select list(id order by id) from my_datalake.default.fast_forward_conflict;
+----
+[1, 4, 5, 6]
+
+statement ok
+drop table my_datalake.default.fast_forward_conflict;

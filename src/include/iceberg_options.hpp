@@ -50,6 +50,13 @@ static constexpr const char *SKIP_PUFFIN_VERIFICATION_CONFIG_VARIABLE = "iceberg
 // the equality-delete read path.
 static constexpr const char *ENABLE_EQUALITY_DELETES_CONFIG_VARIABLE = "__iceberg_unsafe_enable_equality_deletes";
 
+static constexpr const char *ICEBERG_MAIN_BRANCH = "main";
+static constexpr idx_t MAX_ICEBERG_REF_NAME_LENGTH = 255;
+
+//! Throws if 'name' is not acceptable as the name of a ref this extension creates (a new branch or tag).
+//! 'subject' starts each error message, e.g. "Iceberg ref name".
+void ValidateIcebergRefName(const string &name, const string &subject);
+
 static constexpr const char *UNSAFE_STRUCT_NULL_DEFAULT_INTERP_CONFIG_VARIABLE =
     "__iceberg_unsafe_struct_null_default_interp";
 
