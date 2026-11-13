@@ -109,27 +109,6 @@ static string ConstructTableUpdateJSON(rest_api_objects::CommitTableRequest &tab
 	return RESTObjectToJSONString(table_change);
 }
 
-static rest_api_objects::TableRequirement CreateAssertRefSnapshotIdRequirement(const IcebergSnapshot &old_snapshot) {
-	rest_api_objects::TableRequirement req;
-	req.assert_ref_snapshot_id = rest_api_objects::AssertRefSnapshotId();
-
-	auto &res = *req.assert_ref_snapshot_id;
-	res.ref = "main";
-	res.snapshot_id = old_snapshot.snapshot_id;
-	res.type = "assert-ref-snapshot-id";
-	return req;
-}
-
-static rest_api_objects::TableRequirement CreateAssertNoSnapshotRequirement() {
-	rest_api_objects::TableRequirement req;
-	req.assert_ref_snapshot_id = rest_api_objects::AssertRefSnapshotId();
-
-	auto &res = *req.assert_ref_snapshot_id;
-	res.ref = "main";
-	res.type = "assert-ref-snapshot-id";
-	return req;
-}
-
 static bool NeedsAssertSchemaId(const IcebergTransactionData &transaction_data, const IcebergTable &table_info) {
 	(void)table_info;
 	return transaction_data.assert_schema_id;
@@ -189,7 +168,8 @@ struct IcebergRetryBackoff {
 
 static void CreateTableRequirements(DatabaseInstance &db, ClientContext &context, IcebergCommitState &commit_state,
                                     const IcebergTransactionData &transaction_data,
-                                    const optional_ptr<const IcebergSnapshot> &current_snapshot) {
+                                    const IcebergBranchHead &branch_head) {
+	auto &current_snapshot = branch_head.ref_snapshot;
 	const bool has_assert_create = transaction_data.has_assert_create;
 	for (auto &requirement : transaction_data.requirements) {
 		requirement->CreateRequirement(db, context, commit_state);
@@ -203,59 +183,65 @@ static void CreateTableRequirements(DatabaseInstance &db, ClientContext &context
 		uuid_requirement.CreateRequirement(db, context, commit_state);
 	}
 	if (transaction_data.replaces_table) {
+		//! Table replacement detaches main (TableReplaceContents); it asserts main is still where the transaction
+		//! found it, and is not combined with writes to another branch.
+		if (!branch_head.IsMain()) {
+			ThrowCommitRefusal(ExceptionType::INVALID_INPUT,
+			                   StringUtil::Format("Cannot replace table \"%s\" while writing to Iceberg branch '%s'",
+			                                      commit_state.table_info.name, branch_head.branch));
+		}
 		AssertRefSnapshotId requirement(transaction_data.initial_snapshot_id);
 		requirement.CreateRequirement(db, context, commit_state);
-	} else if (current_snapshot && !transaction_data.alters.empty()) {
-		commit_state.table_change.requirements.push_back(CreateAssertRefSnapshotIdRequirement(*current_snapshot));
-	} else if (!current_snapshot && !transaction_data.alters.empty() && !has_assert_create) {
-		commit_state.table_change.requirements.push_back(CreateAssertNoSnapshotRequirement());
+		return;
+	}
+	if (transaction_data.alters.empty() || (!current_snapshot && has_assert_create)) {
+		return;
+	}
+	//! The branch the commit moves must still point at the snapshot the commit builds on; a branch the commit
+	//! creates (or main of a table without snapshots) must still not exist (a null snapshot id)
+	optional<int64_t> expected_snapshot_id;
+	if (current_snapshot) {
+		expected_snapshot_id = current_snapshot->snapshot_id;
+	}
+	AssertRefSnapshotId branch_requirement(branch_head.branch, expected_snapshot_id);
+	branch_requirement.CreateRequirement(db, context, commit_state);
+	if (!branch_head.IsMain() && !current_snapshot && branch_head.base_snapshot) {
+		//! A commit that creates the branch builds on main's head in this attempt's metadata (its parent and the
+		//! manifest list it carries forward). Main must still be there: otherwise another engine may have expired
+		//! that snapshot and cleaned up its files, and the new branch would reference deleted manifests. A 409 is
+		//! retried onto main's new head under the usual rules. Stricter than Java's client, which asserts only the
+		//! ref the commit changes (apache-iceberg-1.10.0,
+		//! core/src/main/java/org/apache/iceberg/UpdateRequirements.java:117-129, client-side).
+		AssertRefSnapshotId main_requirement(ICEBERG_MAIN_BRANCH, branch_head.base_snapshot->snapshot_id);
+		main_requirement.CreateRequirement(db, context, commit_state);
 	}
 }
 
-//! Safe to re-apply a DELETE on retry only if every commit in (base, tip] was a
-//! pure append and the tip descends from the scanned snapshot. Keep the sequence
-//! range validation, then verify ancestry to reject replacement lineage breaks.
+//! Safe to re-apply a DELETE on retry only if the target branch's tip descends from the
+//! scanned base and every snapshot on that path, (base, tip], is a pure append; anything
+//! else may have removed/rewritten the target data. Walks parent-snapshot-id from the tip,
+//! so commits to other branches are ignored, and a branch that was reset or recreated (tip
+//! not descending from base) is not reappliable. A snapshot missing from the metadata
+//! (e.g. expired history) can't be proven safe, so it counts as not reappliable.
 static bool DeleteCanReapply(const IcebergTableMetadata &metadata, int64_t base_snapshot_id, int64_t tip_snapshot_id) {
 	if (base_snapshot_id == tip_snapshot_id) {
 		return true;
 	}
-	auto base = metadata.FindSnapshotByIdInternal(base_snapshot_id);
-	auto tip = metadata.FindSnapshotByIdInternal(tip_snapshot_id);
-	if (!base || !tip) {
+	if (!metadata.FindSnapshotByIdInternal(base_snapshot_id)) {
 		return false;
 	}
-	if (!base->sequence_number || !tip->sequence_number) {
-		throw InvalidConfigurationException("Committed snapshot is missing a sequence number");
-	}
-	int64_t base_sequence = *base->sequence_number;
-	int64_t tip_sequence = *tip->sequence_number;
-	for (auto &entry : metadata.snapshots) {
-		auto &snapshot = entry.second;
-		if (!snapshot.sequence_number) {
-			throw InvalidConfigurationException("Committed snapshot is missing a sequence number");
+	auto cursor = metadata.FindSnapshotByIdInternal(tip_snapshot_id);
+	//! Each step visits a distinct snapshot of an acyclic history; the bound stops malformed (cyclic) metadata
+	for (idx_t steps = 0; cursor && steps <= metadata.snapshots.size(); steps++) {
+		if (cursor->snapshot_id == base_snapshot_id) {
+			return true;
 		}
-		int64_t sequence = *snapshot.sequence_number;
-		if (sequence <= base_sequence || sequence > tip_sequence) {
-			continue;
-		}
-		if (snapshot.operation != IcebergSnapshotOperationType::APPEND) {
+		if (cursor->operation != IcebergSnapshotOperationType::APPEND || !cursor->parent_snapshot_id) {
 			return false;
 		}
+		cursor = metadata.FindSnapshotByIdInternal(*cursor->parent_snapshot_id);
 	}
-	// Replacement can publish a newer append with no parent. Sequence order alone
-	// does not prove that the tip continues the history the DELETE scanned.
-	unordered_set<int64_t> visited;
-	auto ancestor = tip;
-	while (ancestor->snapshot_id != base_snapshot_id) {
-		if (!ancestor->parent_snapshot_id || !visited.insert(ancestor->snapshot_id).second) {
-			return false;
-		}
-		ancestor = metadata.FindSnapshotByIdInternal(*ancestor->parent_snapshot_id);
-		if (!ancestor) {
-			return false;
-		}
-	}
-	return true;
+	return false;
 }
 
 //! Throw if a retried DELETE can't be safely re-applied. No-op on the first
@@ -274,10 +260,23 @@ static void VerifyDeleteRetryability(const IcebergTable &table_info,
 	if (!transaction_data.base_snapshot_id) {
 		return;
 	}
-	if (!current_snapshot) {
-		return;
-	}
 	auto scan_snapshot_id = *transaction_data.base_snapshot_id;
+	if (!current_snapshot) {
+		if (transaction_data.GetTargetBranch() == ICEBERG_MAIN_BRANCH) {
+			//! Main lost its snapshot (e.g. a table replacement detached it). As before WAP writes, the DELETE is
+			//! re-staged without a parent, asserting main is still absent (native test "DELETE keeps its existing
+			//! retry behavior when replacement leaves no snapshot"); VerifyCommitBranch already refused it if the
+			//! table has other branches.
+			return;
+		}
+		//! Not reached today: VerifyCommitBranch refuses a removed branch, and a missing branch while main has no
+		//! snapshot. Kept so a DELETE is never re-staged without a parent on a branch. Raised while staging the
+		//! attempt, before anything of it is sent.
+		ThrowCommitRefusal(ExceptionType::TRANSACTION,
+		                   StringUtil::Format("DELETE on \"%s\" conflicts with a concurrent commit (scanned snapshot "
+		                                      "%s, the branch now has no snapshot); re-run the DELETE",
+		                                      table_info.name, std::to_string(scan_snapshot_id)));
+	}
 	auto tip_snapshot_id = current_snapshot->snapshot_id;
 
 	//! Nothing to reconcile if the tip hasn't moved since we scanned (e.g. the first attempt).
@@ -312,8 +311,16 @@ static SingleTableStagedCommit StageSingleTableCommit(DatabaseInstance &db, Iceb
 	table_change.identifier->name = table_info.name;
 
 	auto &metadata = commit_state.table_info.GetMetadata();
-	auto current_snapshot = metadata.GetLatestSnapshot();
 	auto &transaction_data = *commit_state.table_info.transaction_data;
+	//! Resolved again on every attempt, so a retry rebases onto the branch's refreshed head; throws if the ref
+	//! became a tag
+	auto branch_head = metadata.GetBranchHead(commit_state.branch);
+	if (!branch_head.IsMain() && transaction_data.has_assert_create) {
+		throw InternalException("A table created in this transaction can not be committed to branch '%s'",
+		                        branch_head.branch);
+	}
+	transaction_data.VerifyCommitBranch(metadata, branch_head);
+	auto current_snapshot = branch_head.base_snapshot;
 	transaction_data.VerifyMergeDeletesComplete();
 	info.retryable = transaction_data.SupportsAppendRetry();
 	info.retry_config = IcebergRetryConfig::FromTableMetadata(metadata);
@@ -327,11 +334,12 @@ static SingleTableStagedCommit StageSingleTableCommit(DatabaseInstance &db, Iceb
 		update->CreateUpdate(db, context, commit_state);
 	}
 
-	CreateTableRequirements(db, context, commit_state, transaction_data, current_snapshot);
+	CreateTableRequirements(db, context, commit_state, transaction_data, branch_head);
 
 	if (!transaction_data.alters.empty()) {
 		auto &snapshot = *commit_state.GetLatestSnapshot();
-		SetSnapshotRef set_snapshot_ref(snapshot.snapshot_id);
+		//! Only the target branch moves; a WAP commit leaves main (and current-snapshot-id) untouched
+		SetSnapshotRef set_snapshot_ref(snapshot.snapshot_id, branch_head.branch);
 		set_snapshot_ref.CreateUpdate(db, context, commit_state);
 	}
 

@@ -528,6 +528,15 @@ RewritePlan PlanRewrite(ClientContext &context, RewriteDataFilesPlanInput input)
 	RewritePlan plan;
 	plan.table_name = input.table_name;
 
+	//! The rewrite plans against main and commits to main; under a WAP branch its scan would read the branch instead
+	auto wap_branch = GetIcebergWapBranch(context);
+	if (wap_branch != ICEBERG_MAIN_BRANCH) {
+		throw NotImplementedException("Cannot rewrite data files of table \"%s\" while '%s' is set to '%s'; reset it "
+		                              "to rewrite main",
+		                              input.table_name.Name().GetIdentifierName(), WAP_BRANCH_CONFIG_VARIABLE,
+		                              wap_branch);
+	}
+
 	auto table_info_ptr = ReloadIcebergTableShared(context, input.table_name, "iceberg_rewrite_data_files");
 	auto &table_info = *table_info_ptr;
 	ThrowIfTableHasPendingChanges(context, table_info);

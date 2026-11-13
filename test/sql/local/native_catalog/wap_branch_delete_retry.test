@@ -1,0 +1,237 @@
+# name: test/sql/local/native_catalog/wap_branch_delete_retry.test
+# description: A DELETE under iceberg_wap_branch is re-applied on retry only over appends to its own branch
+# group: [native_catalog]
+
+require-env CATALOG_TEST_CONFIG_SETUP mock
+
+include test/sql/init_requires
+
+require json
+
+# Moves (or creates) a ref through the catalog, as another engine would
+statement ok
+SET VARIABLE set_ref = $$
+SELECT status FROM iceberg_test_catalog_request('POST', '/v1/namespaces/default/tables/TBL',
+	'{"requirements": [], "updates": [{"action": "set-snapshot-ref", "ref-name": "REF", "type": "TYPE", "snapshot-id": SNAP}]}')
+$$;
+
+statement ok
+SET VARIABLE remove_ref = $$
+SELECT status FROM iceberg_test_catalog_request('POST', '/v1/namespaces/default/tables/TBL',
+	'{"requirements": [], "updates": [{"action": "remove-snapshot-ref", "ref-name": "REF"}]}')
+$$;
+
+# ---------------------------------------------------------------------------
+# DELETE retries on a branch (write.delete.isolation-level = snapshot)
+
+statement ok
+CREATE TABLE my_datalake.default.wap_del (id INTEGER) WITH ('write.delete.isolation-level' = 'snapshot');
+
+statement ok
+INSERT INTO my_datalake.default.wap_del VALUES (1), (2), (3);
+
+statement ok
+SET VARIABLE del_main = (SELECT snapshot_id FROM iceberg_refs(my_datalake.default.wap_del) WHERE name = 'main');
+
+statement ok con1
+SET iceberg_wap_branch = 'audit';
+
+statement ok con2
+SET iceberg_wap_branch = 'audit';
+
+statement ok con1
+INSERT INTO my_datalake.default.wap_del VALUES (4);
+
+statement ok
+SET VARIABLE del_a1 = (SELECT snapshot_id FROM iceberg_refs(my_datalake.default.wap_del) WHERE name = 'audit');
+
+statement ok con1
+INSERT INTO my_datalake.default.wap_del VALUES (5);
+
+# A DELETE is re-applied over concurrent appends to its branch
+statement ok con1
+BEGIN;
+
+statement ok con1
+DELETE FROM my_datalake.default.wap_del WHERE id = 1;
+
+statement ok con2
+INSERT INTO my_datalake.default.wap_del VALUES (6);
+
+statement ok con1
+COMMIT;
+
+query I con1
+SELECT id FROM my_datalake.default.wap_del ORDER BY id;
+----
+2
+3
+4
+5
+6
+
+# A concurrent commit to main is not on its branch, but it advances the table-wide last-sequence-number: the catalog
+# rejects the branch commit with a 400 (as servers on Iceberg's Java library before 1.11, apache/iceberg#15001)
+statement ok con1
+BEGIN;
+
+statement ok con1
+DELETE FROM my_datalake.default.wap_del WHERE id = 2;
+
+statement ok
+DELETE FROM my_datalake.default.wap_del WHERE id = 3;
+
+statement error con1
+COMMIT;
+----
+Cannot add snapshot with sequence number
+
+query I con1
+SELECT id FROM my_datalake.default.wap_del ORDER BY id;
+----
+2
+3
+4
+5
+6
+
+query I
+SELECT id FROM my_datalake.default.wap_del ORDER BY id;
+----
+1
+2
+
+# A branch reset to an older snapshot while the DELETE ran: its base is no longer on the branch
+statement ok con1
+BEGIN;
+
+statement ok con1
+DELETE FROM my_datalake.default.wap_del WHERE id = 4;
+
+query I
+SELECT * FROM query(getvariable('set_ref').replace('TBL', 'wap_del').replace('REF', 'audit').replace('TYPE', 'branch').replace('SNAP', getvariable('del_a1')::VARCHAR));
+----
+200
+
+statement error con1
+COMMIT;
+----
+conflicts with a concurrent commit
+
+query I con1
+SELECT id FROM my_datalake.default.wap_del ORDER BY id;
+----
+1
+2
+3
+4
+
+# A branch recreated from main while the DELETE ran
+statement ok con1
+BEGIN;
+
+statement ok con1
+DELETE FROM my_datalake.default.wap_del WHERE id = 1;
+
+query I
+SELECT * FROM query(getvariable('remove_ref').replace('TBL', 'wap_del').replace('REF', 'audit'));
+----
+200
+
+query I
+SELECT * FROM query(getvariable('set_ref').replace('TBL', 'wap_del').replace('REF', 'audit').replace('TYPE', 'branch').replace('SNAP', getvariable('del_main')::VARCHAR));
+----
+200
+
+statement error con1
+COMMIT;
+----
+conflicts with a concurrent commit
+
+# A branch removed while the transaction ran is not recreated from main. The refusal is definitive (nothing was
+# sent), so the data file the INSERT wrote is deleted
+statement ok
+BEGIN;
+
+statement ok
+SET VARIABLE wap_del_glob = (
+	SELECT parse_dirpath(file_path) || '/*.parquet' FROM iceberg_metadata(my_datalake.default.wap_del)
+	WHERE content = 'DATA' LIMIT 1
+);
+
+statement ok
+SET VARIABLE wap_del_files = (SELECT count(*) FROM glob(getvariable('wap_del_glob')));
+
+statement ok
+COMMIT;
+
+statement ok con1
+BEGIN;
+
+statement ok con1
+INSERT INTO my_datalake.default.wap_del VALUES (7);
+
+query I
+SELECT count(*) = getvariable('wap_del_files') + 1 FROM glob(getvariable('wap_del_glob'));
+----
+true
+
+query I
+SELECT * FROM query(getvariable('remove_ref').replace('TBL', 'wap_del').replace('REF', 'audit'));
+----
+200
+
+statement error con1
+COMMIT;
+----
+was removed concurrently
+
+query I
+SELECT count(*) = getvariable('wap_del_files') FROM glob(getvariable('wap_del_glob'));
+----
+true
+
+query T
+SELECT name FROM iceberg_refs(my_datalake.default.wap_del) ORDER BY name;
+----
+main
+
+# A branch created as a tag while the transaction ran is not written to
+statement ok con1
+BEGIN;
+
+statement ok con1
+INSERT INTO my_datalake.default.wap_del VALUES (8);
+
+query I
+SELECT * FROM query(getvariable('set_ref').replace('TBL', 'wap_del').replace('REF', 'audit').replace('TYPE', 'tag').replace('SNAP', getvariable('del_main')::VARCHAR));
+----
+200
+
+statement error con1
+COMMIT;
+----
+is a tag, not a branch
+
+query TT
+SELECT name, type FROM iceberg_refs(my_datalake.default.wap_del) ORDER BY name;
+----
+audit	TAG
+main	BRANCH
+
+# None of this moved main past the plain main DELETE
+query I
+SELECT count(*) FROM iceberg_snapshots(my_datalake.default.wap_del)
+WHERE snapshot_id = (SELECT snapshot_id FROM iceberg_refs(my_datalake.default.wap_del) WHERE name = 'main')
+AND parent_id = getvariable('del_main');
+----
+1
+
+statement ok con1
+RESET iceberg_wap_branch;
+
+statement ok con2
+RESET iceberg_wap_branch;
+
+statement ok
+DROP TABLE my_datalake.default.wap_del;

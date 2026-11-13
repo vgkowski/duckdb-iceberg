@@ -26,6 +26,7 @@
 #include "common/iceberg_default.hpp"
 #include "catalog/rest/transaction/iceberg_transaction.hpp"
 #include "catalog/rest/iceberg_file_credentials.hpp"
+#include "catalog/rest/transaction/iceberg_transaction_data.hpp"
 
 namespace duckdb {
 class OAuth2Authorization;
@@ -79,7 +80,12 @@ TableFunction IcebergTableSchemaVersion::GetScanFunction(ClientContext &context,
 	auto snapshot_lookup = IcebergSnapshotLookup::FromAtClause(lookup.GetAtClause());
 
 	IcebergSnapshotScanInfo snapshot_info;
-	snapshot_info = metadata.GetSnapshot(snapshot_lookup);
+	if (snapshot_lookup.IsLatest()) {
+		//! Without an AT clause the session's WAP branch is read (main when unset), as Spark with spark.wap.branch
+		snapshot_info = GetWapReadSnapshot(context, metadata, table_info.transaction_data.get());
+	} else {
+		snapshot_info = GetLookupSnapshot(metadata, snapshot_lookup, table_info.transaction_data.get());
+	}
 	//! Override whatever schema id the lookup resulted in
 	//! The schema is preset by the IcebergCatalogEntry and we can not deviate from that
 	snapshot_info.schema_id = schema_id;
@@ -92,7 +98,7 @@ TableFunction IcebergTableSchemaVersion::GetScanFunction(ClientContext &context,
 	auto &transaction = IcebergTransaction::Get(context, catalog);
 	scan_info->serialization_transaction_id = transaction.scan_serialization_id;
 	scan_info->serialization_query_id = transaction.active_query.load();
-	if (table_info.transaction_data && snapshot_info.is_transaction_head) {
+	if (table_info.transaction_data && table_info.transaction_data->IsVisibleIn(snapshot_info)) {
 		scan_info->transaction_data = table_info.transaction_data.get();
 	}
 

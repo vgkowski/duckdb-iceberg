@@ -13,6 +13,11 @@
 
 namespace duckdb {
 
+void ThrowCommitRefusal(ExceptionType type, const string &message) {
+	unordered_map<string, string> extra_info {{"status_code", "400"}};
+	throw Exception(extra_info, type, message);
+}
+
 static void AssignManifestFirstRowIds(const IcebergTableMetadata &metadata,
                                       optional_ptr<const IcebergSnapshot> current_snapshot,
                                       vector<IcebergManifestListEntry> &existing_manifest_list,
@@ -54,9 +59,16 @@ static unique_ptr<IcebergTableMetadata> CreateFormatMetadata(const IcebergTable 
 	return nullptr;
 }
 
+static string GetCommitBranch(const IcebergTable &table_info) {
+	if (!table_info.transaction_data) {
+		return ICEBERG_MAIN_BRANCH;
+	}
+	return table_info.transaction_data->GetTargetBranch();
+}
+
 IcebergCommitState::IcebergCommitState(const IcebergTable &table_info, ClientContext &context)
     : format_metadata(CreateFormatMetadata(table_info)), table_info(table_info), context(context),
-      last_sequence_number(GetTableMetadata().last_sequence_number),
+      branch(GetCommitBranch(table_info)), last_sequence_number(GetTableMetadata().last_sequence_number),
       row_ids(GetTableMetadata().iceberg_version >= 3 ? GetTableMetadata().next_row_id.value_or(0) : 0) {
 }
 
@@ -70,7 +82,11 @@ optional_ptr<const IcebergSnapshot> IcebergCommitState::GetLatestSnapshot() cons
 	if (written_snapshot) {
 		return *written_snapshot;
 	}
-	return GetTableMetadata().GetLatestSnapshot();
+	return GetBranchHead().base_snapshot;
+}
+
+IcebergBranchHead IcebergCommitState::GetBranchHead() const {
+	return GetTableMetadata().GetBranchHead(branch);
 }
 
 int64_t IcebergCommitState::ReconstructTotalFilesSize(int32_t schema_id) {
@@ -207,7 +223,8 @@ void IcebergCommitState::LoadExistingManifests(DatabaseInstance &db,
                                                vector<IcebergManifestListEntry> &&existing_manifests) {
 	manifests = std::move(existing_manifests);
 	auto &metadata = GetTableMetadata();
-	auto current_snapshot = metadata.GetLatestSnapshot();
+	//! The manifests of the commit's parent: the target branch's head (retries reload it from refreshed metadata)
+	auto current_snapshot = GetBranchHead().base_snapshot;
 	if (manifests.empty() && current_snapshot) {
 		IcebergSnapshotScanInfo snapshot_info;
 		snapshot_info.snapshot = current_snapshot;

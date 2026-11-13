@@ -60,10 +60,12 @@ static void LoadMissingManifestCounts(ClientContext &context, const IcebergTable
 }
 
 static optional<int64_t> LoadExistingManifestList(ClientContext &context, const IcebergTableMetadata &metadata,
+                                                  const string &branch,
                                                   vector<IcebergManifestListEntry> &existing_manifest_list) {
 	existing_manifest_list.clear();
 
-	auto current_snapshot = metadata.GetLatestSnapshot();
+	//! The write builds on the target branch's head (main's current snapshot for main or a branch to be created)
+	auto current_snapshot = metadata.GetBranchHead(branch).base_snapshot;
 	if (!current_snapshot) {
 		return {};
 	}
@@ -238,11 +240,193 @@ bool IcebergTransactionData::RetryStateMatches(const IcebergTable &table) const 
 	return true;
 }
 
+IcebergSnapshotScanInfo GetWapReadSnapshot(ClientContext &context, const IcebergTableMetadata &metadata,
+                                           optional_ptr<const IcebergTransactionData> transaction_data) {
+	auto wap_branch = GetIcebergWapBranch(context);
+	bool pending_creation = false;
+	if (transaction_data) {
+		transaction_data->VerifyTargetBranch(wap_branch);
+		if (wap_branch != ICEBERG_MAIN_BRANCH && transaction_data->has_assert_create) {
+			ThrowWapReadOfCreatedTable(transaction_data->table_info.name, wap_branch);
+		}
+		pending_creation = transaction_data->CreatesBranch(wap_branch);
+	}
+	return metadata.GetBranchReadSnapshot(wap_branch, pending_creation);
+}
+
+IcebergSnapshotScanInfo GetLookupSnapshot(const IcebergTableMetadata &metadata, const IcebergSnapshotLookup &lookup,
+                                          optional_ptr<const IcebergTransactionData> transaction_data) {
+	if (transaction_data && lookup.IsFromRef()) {
+		auto &ref_name = lookup.GetSnapshotRef().name;
+		if (!metadata.HasRef(ref_name) && transaction_data->CreatesBranch(ref_name)) {
+			return metadata.GetBranchReadSnapshot(ref_name, true);
+		}
+	}
+	return metadata.GetSnapshot(lookup);
+}
+
+void ThrowWapReadOfCreatedTable(const string &table_name, const string &wap_branch) {
+	//! A new table has no branches until its first commit, which must go to main
+	throw InvalidInputException("Table \"%s\" is created in this transaction, so it has no branch '%s' to read; read "
+	                            "it with AT (VERSION => 'main') or RESET %s",
+	                            table_name, wap_branch, WAP_BRANCH_CONFIG_VARIABLE);
+}
+
+const string &IcebergTransactionData::GetTargetBranch() const {
+	return target_branch;
+}
+
+void IcebergTransactionData::VerifyTargetBranch(const string &session_branch) const {
+	if (!target_branch_bound || session_branch == target_branch) {
+		return;
+	}
+	throw InvalidInputException("Table \"%s\" was changed on branch '%s' in this transaction, so it can not be used "
+	                            "with '%s' = '%s' before the transaction ends",
+	                            table_info.name, target_branch, WAP_BRANCH_CONFIG_VARIABLE, session_branch);
+}
+
+void IcebergTransactionData::BindTargetBranch(lock_guard<mutex> &guard) {
+	(void)guard;
+	auto session_branch = GetIcebergWapBranch(context);
+	if (replaces_table && session_branch != ICEBERG_MAIN_BRANCH) {
+		//! A replacement detaches main (TableReplaceContents); its contents can only be written to main. Refused
+		//! by the statement, before it loads a manifest list, rather than only at commit (CreateTableRequirements).
+		throw InvalidInputException("Cannot replace table \"%s\" while writing to Iceberg branch '%s'", table_info.name,
+		                            session_branch);
+	}
+	if (target_branch_bound) {
+		VerifyTargetBranch(session_branch);
+		return;
+	}
+	if (session_branch != ICEBERG_MAIN_BRANCH) {
+		if (has_assert_create) {
+			throw NotImplementedException("Cannot write table \"%s\" to branch '%s': it is created in this "
+			                              "transaction, and a new table's first commit must go to main",
+			                              table_info.name, session_branch);
+		}
+		//! Throws now, rather than at commit, if the ref is a tag
+		auto head = table_info.GetMetadata().GetBranchHead(session_branch);
+		target_branch_existed = head.ref_snapshot != nullptr;
+		may_create_branch = GetIcebergWapBranchCreateMissing(context);
+		if (!target_branch_existed && !may_create_branch) {
+			throw InvalidInputException("Iceberg branch '%s' does not exist in table \"%s\", and '%s' is false",
+			                            session_branch, table_info.name, WAP_BRANCH_CREATE_MISSING_CONFIG_VARIABLE);
+		}
+		if (!target_branch_existed && !head.base_snapshot) {
+			ThrowParentlessCommit(session_branch, table_info.GetMetadata().HasBranchOtherThanMain());
+		}
+	} else if (!has_assert_create) {
+		auto &metadata = table_info.GetMetadata();
+		if (!metadata.GetBranchHead(session_branch).base_snapshot && metadata.HasBranchOtherThanMain()) {
+			ThrowParentlessCommit(session_branch, true);
+		}
+	}
+	target_branch = std::move(session_branch);
+	target_branch_bound = true;
+}
+
+void IcebergTransactionData::VerifyReadBranch(lock_guard<mutex> &guard,
+                                              optional_ptr<const IcebergSnapshotScanInfo> read_snapshot) const {
+	(void)guard;
+	if (!read_snapshot || (read_snapshot->is_transaction_head && read_snapshot->head_branch == target_branch)) {
+		return;
+	}
+	throw InvalidInputException("Cannot change table \"%s\" on branch '%s': the statement read %s; re-run it",
+	                            table_info.name, target_branch,
+	                            read_snapshot->is_transaction_head ? "branch '" + read_snapshot->head_branch + "'"
+	                                                               : string("a snapshot that is not a branch head"));
+}
+
+bool IcebergTransactionData::IsVisibleIn(const IcebergSnapshotScanInfo &snapshot) const {
+	//! Before the first data-changing statement the target is "main", and nothing is staged for a branch
+	return snapshot.is_transaction_head && snapshot.head_branch == target_branch;
+}
+
+bool IcebergTransactionData::CreatesBranch(const string &branch) const {
+	return target_branch_bound && !target_branch_existed && target_branch == branch && !alters.empty();
+}
+
+void IcebergTransactionData::VerifyCommitBranch(const IcebergTableMetadata &metadata,
+                                                const IcebergBranchHead &branch_head) const {
+	if (alters.empty()) {
+		return;
+	}
+	if (branch_head.IsMain()) {
+		//! Checked against the refreshed metadata of every attempt: another engine may have committed to a branch
+		//! while main still has no snapshot
+		if (!branch_head.base_snapshot && metadata.HasBranchOtherThanMain()) {
+			ThrowParentlessCommit(branch_head.branch, true);
+		}
+		return;
+	}
+	if (branch_head.ref_snapshot) {
+		//! The branch exists now. If this transaction meant to create it (!target_branch_existed) and another writer
+		//! created it first, the retry appends onto that writer's branch head. Java clients (Spark) do the same,
+		//! client-side: every attempt refreshes and takes SnapshotUtil.latestSnapshot(base, targetBranch) as the
+		//! parent (apache-iceberg-1.10.1, core/src/main/java/org/apache/iceberg/SnapshotProducer.java:253-256). A
+		//! DELETE is only re-applied if that head descends from the snapshot it read (VerifyDeleteRetryability)
+		return;
+	}
+	//! The refusals below are raised while staging a commit attempt, before anything of it is sent
+	if (target_branch_existed) {
+		//! Recreating it from main would rebase this transaction's changes onto main's lineage
+		ThrowCommitRefusal(ExceptionType::TRANSACTION,
+		                   StringUtil::Format("Iceberg branch '%s' of table \"%s\" was removed concurrently; the "
+		                                      "changes made on it in this transaction are not committed",
+		                                      branch_head.branch, table_info.name));
+	}
+	if (!may_create_branch) {
+		ThrowCommitRefusal(ExceptionType::INVALID_INPUT,
+		                   StringUtil::Format("Iceberg branch '%s' does not exist in table \"%s\", and '%s' is false",
+		                                      branch_head.branch, table_info.name,
+		                                      WAP_BRANCH_CREATE_MISSING_CONFIG_VARIABLE));
+	}
+	if (!branch_head.base_snapshot) {
+		//! Checked against the refreshed metadata of every attempt: main may have lost its snapshot since bind
+		ThrowParentlessCommit(branch_head.branch, metadata.HasBranchOtherThanMain());
+	}
+}
+
+void IcebergTransactionData::ThrowParentlessCommit(const string &branch, bool table_has_other_branches) const {
+	//! The commit's first snapshot would have no parent. Iceberg catalogs (Java's TableMetadata.Builder.addSnapshot)
+	//! skip the sequence-number check for such a snapshot and adopt its sequence number as last-sequence-number
+	//! (server-side, apache-iceberg-1.10.1, core/src/main/java/org/apache/iceberg/TableMetadata.java:1250-1259), so
+	//! one staged on stale metadata would not be above the current last-sequence-number (it could equal or lower
+	//! it), and later deletes would not apply to newer data files. That needs
+	//! another ref that can receive concurrent commits; without one (an empty table, or one whose old snapshots are
+	//! unreferenced after a replace) main's first commit is safe. A branch is never created without a parent.
+	//! Raised while staging a statement or a commit attempt, before anything of the attempt is sent
+	if (replaces_table && table_has_other_branches) {
+		//! A replacement detaches main (TableReplaceContents), so its first snapshot has no parent
+		ThrowCommitRefusal(
+		    ExceptionType::INVALID_INPUT,
+		    StringUtil::Format("Cannot write the replacement contents of table \"%s\": the table has branches other "
+		                       "than main, so the replacement's first snapshot would have no parent, and catalogs do "
+		                       "not check the sequence number of a snapshot without a parent. Drop the other branches "
+		                       "in an earlier transaction, or replace the table without writing data",
+		                       table_info.name));
+	}
+	if (table_has_other_branches) {
+		ThrowCommitRefusal(
+		    ExceptionType::INVALID_INPUT,
+		    StringUtil::Format(
+		        "Cannot commit to Iceberg branch '%s' of table \"%s\": main has no snapshot but the table has other "
+		        "branches, so the new snapshot would have no parent, and catalogs do not check the sequence number of "
+		        "a snapshot without a parent. Drop the other branches, or set main with another engine first",
+		        branch, table_info.name));
+	}
+	ThrowCommitRefusal(ExceptionType::INVALID_INPUT,
+	                   StringUtil::Format("Cannot create Iceberg branch '%s' of table \"%s\": main has no snapshot "
+	                                      "yet, so the branch would start without a parent. Insert into main first "
+	                                      "(RESET %s), then write to the branch",
+	                                      branch, table_info.name, WAP_BRANCH_CONFIG_VARIABLE));
+}
+
 void IcebergTransactionData::CacheExistingManifestList(lock_guard<mutex> &guard, const IcebergTableMetadata &metadata) {
 	if (!alters.empty()) {
 		return;
 	}
-	base_snapshot_id = LoadExistingManifestList(context, metadata, existing_manifest_list);
+	base_snapshot_id = LoadExistingManifestList(context, metadata, target_branch, existing_manifest_list);
 	scan_sequence_number = IcebergSnapshot::NextSequenceNumber(metadata.last_sequence_number);
 }
 
@@ -251,9 +435,11 @@ void IcebergTransactionData::AddSnapshot(IcebergSnapshotOperationType operation,
                                          IcebergManifestDeletes &&altered_manifests, bool merge_action) {
 	//! Serialize snapshot operations so transaction scans retain their insertion order.
 	lock_guard<mutex> guard(lock);
-	VerifyNoSnapshotExpiration(updates, "Data changes");
+	//! Before binding the branch or caching the manifest list, so a refused statement changes no state
+	VerifyCanAddSnapshot();
 
 	auto &table_metadata = table_info.GetMetadata();
+	BindTargetBranch(guard);
 	CacheExistingManifestList(guard, table_metadata);
 
 	IcebergManifestContentType manifest_content_type;
@@ -313,6 +499,12 @@ void IcebergTransactionData::VerifyCanAddSnapshot() const {
 void IcebergTransactionData::AddSnapshotUpdate(unique_ptr<IcebergAddSnapshot> add_snapshot,
                                                IcebergManifestDeletes &&altered_manifests, bool merge_action) {
 	VerifyCanAddSnapshot();
+	//! A rewrite (iceberg_rewrite_data_files) is planned and validated against main's current snapshot
+	if (add_snapshot->GetOperation() == IcebergSnapshotOperationType::REPLACE && target_branch != ICEBERG_MAIN_BRANCH) {
+		throw NotImplementedException("Cannot rewrite data files of table \"%s\" while '%s' is set to '%s'; reset it "
+		                              "to rewrite main",
+		                              table_info.name, WAP_BRANCH_CONFIG_VARIABLE, target_branch);
+	}
 	contains_merge |= merge_action;
 	// All action sinks share this execution's query ID; a later statement gets a different ID.
 	auto query_id = transaction.active_query.load();
@@ -342,12 +534,16 @@ void IcebergTransactionData::AddSnapshotUpdate(unique_ptr<IcebergAddSnapshot> ad
 }
 
 void IcebergTransactionData::AddDeleteSnapshot(partitioned_manifest_entry_map_t &&delete_files,
-                                               IcebergManifestDeletes &&altered_manifests, bool merge_action) {
+                                               IcebergManifestDeletes &&altered_manifests, bool merge_action,
+                                               optional_ptr<const IcebergSnapshotScanInfo> read_snapshot) {
 	//! Serialize snapshot operations so transaction scans retain their insertion order.
 	lock_guard<mutex> guard(lock);
-	VerifyNoSnapshotExpiration(updates, "Data changes");
+	//! Before binding the branch or caching the manifest list, so a refused statement changes no state
+	VerifyCanAddSnapshot();
 
 	auto &table_metadata = table_info.GetMetadata();
+	BindTargetBranch(guard);
+	VerifyReadBranch(guard, read_snapshot);
 	CacheExistingManifestList(guard, table_metadata);
 
 	auto add_snapshot = make_uniq<IcebergAddSnapshot>(table_info, IcebergSnapshotOperationType::DELETE);
@@ -361,12 +557,16 @@ void IcebergTransactionData::AddDeleteSnapshot(partitioned_manifest_entry_map_t 
 
 void IcebergTransactionData::AddUpdateSnapshot(partitioned_manifest_entry_map_t &&delete_files,
                                                vector<IcebergManifestEntry> &&data_files,
-                                               IcebergManifestDeletes &&altered_manifests, bool merge_action) {
+                                               IcebergManifestDeletes &&altered_manifests, bool merge_action,
+                                               optional_ptr<const IcebergSnapshotScanInfo> read_snapshot) {
 	//! Serialize snapshot operations so transaction scans retain their insertion order.
 	lock_guard<mutex> guard(lock);
-	VerifyNoSnapshotExpiration(updates, "Data changes");
+	//! Before binding the branch or caching the manifest list, so a refused statement changes no state
+	VerifyCanAddSnapshot();
 
 	auto &table_metadata = table_info.GetMetadata();
+	BindTargetBranch(guard);
+	VerifyReadBranch(guard, read_snapshot);
 
 	CacheExistingManifestList(guard, table_metadata);
 
@@ -461,6 +661,12 @@ void IcebergTransactionData::TableReplaceContents(IcebergTableMetadata &metadata
 	if (!alters.empty() || rolls_back || !modified_refs.empty()) {
 		throw InvalidInputException("Cannot replace table \"%s\": it was already changed in this transaction",
 		                            table_info.name);
+	}
+	//! Replacement detaches main; a session writing to another branch must not replace main underneath it.
+	auto session_branch = GetIcebergWapBranch(context);
+	if (session_branch != ICEBERG_MAIN_BRANCH) {
+		throw NotImplementedException("Cannot replace table \"%s\" while '%s' is set to '%s'", table_info.name,
+		                              WAP_BRANCH_CONFIG_VARIABLE, session_branch);
 	}
 	replaces_table = true;
 	assert_schema_id = true;
@@ -599,6 +805,16 @@ ResolvedRef GetExistingRef(const IcebergTableMetadata &metadata, const string &r
 
 void IcebergTransactionData::TableRollbackToSnapshot(int64_t snapshot_id) {
 	VerifyNoSnapshotExpiration(updates, "Snapshot rollback");
+	//! The rollback moves main; refuse while the session targets another branch rather than surprise a WAP user.
+	//! (Spark's rollback_to_snapshot moves main regardless of spark.wap.branch, client-side: apache-iceberg-1.10.0,
+	//! spark/v3.5/spark/src/main/java/org/apache/iceberg/spark/procedures/RollbackToSnapshotProcedure.java:88)
+	auto session_branch = GetIcebergWapBranch(context);
+	if (session_branch != ICEBERG_MAIN_BRANCH) {
+		throw NotImplementedException("Cannot roll back table \"%s\" while '%s' is set to '%s': rollback moves main. "
+		                              "RESET %s to roll main back",
+		                              table_info.name, WAP_BRANCH_CONFIG_VARIABLE, session_branch,
+		                              WAP_BRANCH_CONFIG_VARIABLE);
+	}
 	//! The commit points main at the last snapshot the transaction adds, which would undo the rollback
 	if (!alters.empty() || rolls_back || modified_refs.count("main")) {
 		throw InvalidInputException("Cannot roll back table \"%s\": it was already changed in this transaction",
@@ -645,7 +861,8 @@ void IcebergTransactionData::VerifyCanChangeRef(const string &ref_name) const {
 	}
 	VerifyNoSnapshotExpiration(updates, "Ref changes");
 	if (!alters.empty()) {
-		//! The commit points main at the transaction's last new snapshot, which was based on the old refs.
+		//! The commit points its target branch (main, or the iceberg_wap_branch) at the transaction's last new
+		//! snapshot, which was based on the old refs.
 		throw InvalidInputException("Cannot change refs of table \"%s\": its rows were already changed in this "
 		                            "transaction",
 		                            table_info.name);
@@ -795,6 +1012,18 @@ IcebergRefMove IcebergTransactionData::TableSetCurrentSnapshot(optional<int64_t>
                                                                const string &source_ref) {
 	if (snapshot_id.has_value() == !source_ref.empty()) {
 		throw InvalidInputException("Exactly one of snapshot_id and ref must be provided");
+	}
+	//! Like rollback, this always moves main (Spark calls ManageSnapshots.setCurrentSnapshot on main, client-side,
+	//! ignoring spark.wap.branch: apache-iceberg-1.10.0, spark/v3.5/spark/src/main/java/org/apache/iceberg/spark/
+	//! procedures/SetCurrentSnapshotProcedure.java:99). Refuse while the session targets another branch, as
+	//! TableRollbackToSnapshot does, rather than move main for a user who expects the WAP branch. fast_forward and
+	//! the create/drop functions name their target ref, so they ignore iceberg_wap_branch.
+	auto session_branch = GetIcebergWapBranch(context);
+	if (session_branch != ICEBERG_MAIN_BRANCH) {
+		throw NotImplementedException("Cannot set the current snapshot of table \"%s\" while '%s' is set to '%s': it "
+		                              "moves main. RESET %s, or publish with iceberg_fast_forward",
+		                              table_info.name, WAP_BRANCH_CONFIG_VARIABLE, session_branch,
+		                              WAP_BRANCH_CONFIG_VARIABLE);
 	}
 	VerifyCanChangeRef("main");
 	auto &metadata = table_info.GetMetadata();

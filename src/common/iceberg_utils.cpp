@@ -15,8 +15,10 @@
 
 #include "catalog/rest/catalog_entry/table/iceberg_table_schema_version.hpp"
 #include "catalog/rest/catalog_entry/table/iceberg_table.hpp"
+#include "catalog/rest/transaction/iceberg_transaction_data.hpp"
 #include "core/metadata/iceberg_table_metadata.hpp"
 #include "catalog/rest/iceberg_file_credentials.hpp"
+#include "iceberg_options.hpp"
 #include "duckdb/catalog/catalog_entry_retriever.hpp"
 
 namespace duckdb {
@@ -286,6 +288,35 @@ string IcebergUtils::GetStorageLocation(ClientContext &context, const string &in
 	return storage_location;
 }
 
+[[noreturn]] static void ThrowWapReadOfPendingBranch(const string &table_name, const string &branch) {
+	throw InvalidInputException("Iceberg branch '%s' of table \"%s\" is created by this transaction; its "
+	                            "pending changes can only be read by querying the table until the "
+	                            "transaction commits",
+	                            branch, table_name);
+}
+
+IcebergSnapshotScanInfo IcebergResolvedMetadata::GetSnapshot(const IcebergTableMetadata &metadata_p,
+                                                             const IcebergSnapshotLookup &lookup) const {
+	if (wap_branch && lookup.IsLatest()) {
+		if (*wap_branch != ICEBERG_MAIN_BRANCH && table_created_in_transaction) {
+			//! Same error as a plain read of the table
+			ThrowWapReadOfCreatedTable(table_name, *wap_branch);
+		}
+		if (wap_branch_pending_creation) {
+			//! The branch exists only in this transaction's pending changes, which these readers do not include:
+			//! main's head would be shown under the branch's name
+			ThrowWapReadOfPendingBranch(table_name, *wap_branch);
+		}
+		return metadata_p.GetBranchReadSnapshot(*wap_branch, wap_branch_pending_creation);
+	}
+	if (wap_branch && wap_branch_pending_creation && lookup.IsFromRef() &&
+	    lookup.GetSnapshotRef().name == *wap_branch && !metadata_p.HasRef(*wap_branch)) {
+		//! As for a read without a snapshot option: the pending branch is not readable here
+		ThrowWapReadOfPendingBranch(table_name, *wap_branch);
+	}
+	return metadata_p.GetSnapshot(lookup);
+}
+
 IcebergResolvedMetadata IcebergUtils::ResolveTableMetadata(ClientContext &context, const string &input,
                                                            const IcebergOptions &options) {
 	{
@@ -299,10 +330,21 @@ IcebergResolvedMetadata IcebergUtils::ResolveTableMetadata(ClientContext &contex
 			auto &iceberg_table = catalog_entry->Cast<IcebergTableSchemaVersion>();
 			iceberg_table.PrepareIcebergScanFromEntry(context);
 			auto &metadata = iceberg_table.table_info.GetMetadata();
-			return IcebergResolvedMetadata(
+			IcebergResolvedMetadata resolved(
 			    metadata.GetLocation(), iceberg_table.table_info.GetMetadataOwner(),
 			    IcebergFileSecret(IcebergFileCredentialsCallback::Get(context, iceberg_table.table_info),
 			                      std::to_string(iceberg_table.table_info.catalog.GetOid())));
+			//! Metadata functions and iceberg_scan of a catalog table see what a plain read sees
+			auto wap_branch = GetIcebergWapBranch(context);
+			auto &transaction_data = iceberg_table.table_info.transaction_data;
+			if (transaction_data) {
+				transaction_data->VerifyTargetBranch(wap_branch);
+				resolved.wap_branch_pending_creation = transaction_data->CreatesBranch(wap_branch);
+				resolved.table_created_in_transaction = transaction_data->has_assert_create;
+			}
+			resolved.wap_branch = std::move(wap_branch);
+			resolved.table_name = iceberg_table.table_info.name;
+			return resolved;
 		}
 	}
 

@@ -1,0 +1,80 @@
+# name: test/sql/local/native_catalog/wap_branch_settings.test
+# description: iceberg_wap_branch and iceberg_wap_branch_create_missing are session settings, and branch names that could be misread are rejected
+# group: [native_catalog]
+
+require-env CATALOG_TEST_CONFIG_SETUP mock
+
+include test/sql/init_requires
+
+require json
+
+# ---------------------------------------------------------------------------
+# Setting validation
+
+statement error
+SET GLOBAL iceberg_wap_branch = 'audit';
+----
+can only be set for the session
+
+statement error
+SET GLOBAL iceberg_wap_branch_create_missing = false;
+----
+can only be set for the session
+
+statement error
+SET iceberg_wap_branch = 'Main';
+----
+must be exactly 'main'
+
+statement error
+SET iceberg_wap_branch = 'MAIN';
+----
+must be exactly 'main'
+
+# Numbers follow Java's Long.parseLong, as AT (VERSION => '...') does
+statement error
+SET iceberg_wap_branch = '+12';
+----
+must not be a number
+
+statement error
+SET iceberg_wap_branch = '-5';
+----
+must not be a number
+
+# Out of int64 range, AT (VERSION => ...) would read it as a ref, but the name rules shared with
+# iceberg_create_branch refuse every all-digit name
+statement error
+SET iceberg_wap_branch = '99999999999999999999';
+----
+must not be a number
+
+# Not numbers for Long.parseLong, so these are ref names
+statement ok
+SET iceberg_wap_branch = '1e3';
+
+statement ok
+SET iceberg_wap_branch = '0x10';
+
+# Long.parseLong also reads non-ASCII decimal digits, so names containing them are rejected
+statement error
+SET iceberg_wap_branch = '١٢٣';
+----
+must not contain non-ASCII digits
+
+statement error
+SET iceberg_wap_branch = '１２';
+----
+must not contain non-ASCII digits
+
+statement error
+SET iceberg_wap_branch = 'audit-٣';
+----
+must not contain non-ASCII digits
+
+statement ok
+SET iceberg_wap_branch = 'audit-é';
+
+statement ok
+RESET iceberg_wap_branch;
+

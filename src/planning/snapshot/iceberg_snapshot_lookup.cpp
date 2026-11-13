@@ -62,24 +62,34 @@ IcebergSnapshotLookup IcebergSnapshotLookup::FromVersion(const Value &value) {
 	if (value.type().id() != LogicalTypeId::VARCHAR) {
 		return FromSnapshotId(value.DefaultCastAs(LogicalType::BIGINT).GetValue<int64_t>());
 	}
+	auto &str = StringValue::Get(value);
+	int64_t snapshot_id;
+	if (TryParseSnapshotId(str, snapshot_id)) {
+		return FromSnapshotId(snapshot_id);
+	}
+	return FromRef(str);
+}
+
+bool IcebergSnapshotLookup::TryParseSnapshotId(const string &str, int64_t &result) {
 	//! An optional sign and ASCII digits in int64 range is a snapshot id; any other string, including one
 	//! that overflows, names a ref. Spark also tries a snapshot id first, client-side (apache-iceberg-1.10.0,
 	//! spark/v3.5/spark/src/main/java/org/apache/iceberg/spark/SparkCatalog.java:187-200)
-	auto &str = StringValue::Get(value);
 	idx_t pos = (!str.empty() && (str[0] == '+' || str[0] == '-')) ? 1 : 0;
 	bool all_digits = pos < str.size();
 	for (idx_t i = pos; i < str.size() && all_digits; i++) {
 		all_digits = StringUtil::CharacterIsDigit(str[i]);
 	}
-	if (all_digits) {
-		errno = 0;
-		char *end = nullptr;
-		auto snapshot_id = std::strtoll(str.c_str(), &end, 10);
-		if (errno != ERANGE && end == str.c_str() + str.size()) {
-			return FromSnapshotId(snapshot_id);
-		}
+	if (!all_digits) {
+		return false;
 	}
-	return FromRef(str);
+	errno = 0;
+	char *end = nullptr;
+	auto snapshot_id = std::strtoll(str.c_str(), &end, 10);
+	if (errno == ERANGE || end != str.c_str() + str.size()) {
+		return false;
+	}
+	result = snapshot_id;
+	return true;
 }
 
 } // namespace duckdb

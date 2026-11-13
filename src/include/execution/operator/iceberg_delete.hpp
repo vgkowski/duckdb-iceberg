@@ -225,6 +225,8 @@ public:
 	                     bool stage_snapshot) const;
 	//! Stage the materialized delete files in this statement's snapshot.
 	void AddDeleteSnapshot(ClientContext &context, IcebergDeleteGlobalState &global_state) const;
+	//! The snapshot the scan of the target table read, if the scan was not optimized away
+	optional_ptr<const IcebergSnapshotScanInfo> GetReadSnapshot() const;
 	//! Write a v2 delete file or serialize a v3 vector for subsequent size-based Puffin packing.
 	IcebergDeleteFileWrite MaterializeDeletes(ClientContext &context, const string &filename,
 	                                          const vector<idx_t> &deleted_rows) const;

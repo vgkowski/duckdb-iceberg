@@ -506,9 +506,13 @@ class Catalog:
             if ref_name == "main" and update["type"] != "branch":
                 invalid("The main ref must be a branch")
             validate_ref_retention(update)
+            existing = metadata["refs"].get(ref_name)
+            # Mock strictness: a set-snapshot-ref never turns a branch into a tag or back
+            if existing is not None and existing["type"] != update["type"]:
+                invalid(f"Cannot change the type of ref {ref_name}")
             metadata["refs"][ref_name] = {k: v for k, v in update.items() if k not in ("action", "ref-name")}
             if ref_name != "main":
-                # Only main determines the current snapshot and its history.
+                # Other refs only point at a snapshot; they never move current-snapshot-id or the snapshot-log
                 return
             if metadata.get("current-snapshot-id") != identifier:
                 # New snapshots are addressable at their own timestamps. Moving main

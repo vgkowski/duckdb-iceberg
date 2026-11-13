@@ -42,6 +42,8 @@ public:
 	//! snapshot id; any other string is a ref name. A ref named like a number is only reachable through
 	//! 'snapshot_from_ref'.
 	static IcebergSnapshotLookup FromVersion(const Value &value);
+	//! Whether a VERSION string is a snapshot id (Java Long.parseLong rules), and if so which
+	static bool TryParseSnapshotId(const string &str, int64_t &result);
 	static IcebergSnapshotLookup FromAtClause(optional_ptr<BoundAtClause> at);
 
 public:

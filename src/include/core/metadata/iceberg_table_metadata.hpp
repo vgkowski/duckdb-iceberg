@@ -61,6 +61,20 @@ public:
 	vector<IcebergStatisticsBlob> blobs;
 };
 
+//! Where a write to a branch lands (see IcebergTableMetadata::GetBranchHead)
+struct IcebergBranchHead {
+	//! The branch name the commit sets ("main" for the default branch)
+	string branch;
+	//! The snapshot the branch points at now; null if the branch does not exist yet (or main has no snapshot).
+	//! The commit asserts the branch still points here.
+	optional_ptr<const IcebergSnapshot> ref_snapshot;
+	//! The snapshot the write builds on (the parent of its first snapshot): the branch's snapshot, or main's
+	//! current snapshot when the commit creates the branch
+	optional_ptr<const IcebergSnapshot> base_snapshot;
+
+	bool IsMain() const;
+};
+
 struct IcebergTableMetadataSchemas {
 public:
 	IcebergTableMetadataSchemas() = default;
@@ -118,6 +132,15 @@ public:
 	//! Resolves a branch or tag from 'refs'; throws if it is missing
 	optional_ptr<const IcebergSnapshot> GetSnapshotByRef(const string &ref_name, bool &is_branch) const;
 	bool HasRef(const string &ref_name) const;
+	//! The head a write to 'branch' builds on. "main" is the current snapshot, as before branches existed. A branch
+	//! missing from 'refs' starts at main's current snapshot (as Iceberg's SnapshotUtil.latestSnapshot); a tag throws.
+	IcebergBranchHead GetBranchHead(const string &branch) const;
+	//! Whether 'refs' holds a branch other than main (tags excluded; an unknown ref type counts as a branch)
+	bool HasBranchOtherThanMain() const;
+	//! What a read without an AT clause sees while 'branch' is the session's WAP branch: the branch head, read with
+	//! the table's current schema (Iceberg spec: branches use the current schema). A missing branch throws, never
+	//! falling back to main, unless 'branch_pending_creation' (this transaction's writes create it from main).
+	IcebergSnapshotScanInfo GetBranchReadSnapshot(const string &branch, bool branch_pending_creation) const;
 
 	//! Version extraction and identification
 	static bool UnsafeVersionGuessingEnabled(ClientContext &context);

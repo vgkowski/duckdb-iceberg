@@ -10,6 +10,7 @@
 
 #include "duckdb/common/printer.hpp"
 #include "duckdb/common/file_system.hpp"
+#include "duckdb/common/optional.hpp"
 #include "duckdb/catalog/catalog_entry/copy_function_catalog_entry.hpp"
 #include "duckdb/storage/external_file_cache/caching_file_system.hpp"
 
@@ -26,9 +27,22 @@ struct IcebergResolvedMetadata {
 	      file_secret(std::move(file_secret_p)) {
 	}
 
+	//! The snapshot 'lookup' selects in 'metadata_p' (this->metadata, or the object it was moved into). For a catalog
+	//! table without a snapshot option this is the head of the session's iceberg_wap_branch, as for a plain read.
+	IcebergSnapshotScanInfo GetSnapshot(const IcebergTableMetadata &metadata_p,
+	                                    const IcebergSnapshotLookup &lookup) const;
+
 	string table_location;
 	shared_ptr<const IcebergTableMetadata> metadata;
 	IcebergFileSecret file_secret;
+	//! Set for catalog tables: the branch a read without a snapshot option sees
+	optional<string> wap_branch;
+	//! Whether the transaction's pending changes create 'wap_branch'
+	bool wap_branch_pending_creation = false;
+	//! Whether the transaction creates the table (has_assert_create): it has no branches yet
+	bool table_created_in_transaction = false;
+	//! The catalog table's name, for errors
+	string table_name;
 };
 
 class IcebergUtils {

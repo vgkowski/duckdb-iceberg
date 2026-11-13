@@ -283,6 +283,39 @@ TEST_CASE("Replacement rejects earlier snapshot expiration without changing tran
 	CheckRows(test.connection, {1, 2, 3});
 }
 
+TEST_CASE("Replacement contents are refused when the table has other branches", "[iceberg_replacement]") {
+	ReplacementTest test;
+	Query(test.connection, "SELECT * FROM iceberg_create_branch('lake.default.t', 'other')");
+	Query(test.connection, "BEGIN");
+	test.Replace();
+	auto result = test.connection.Query("INSERT INTO lake.default.t VALUES (7)");
+	REQUIRE(result->HasError());
+	REQUIRE_THAT(result->GetError(), Catch::Contains("Cannot write the replacement contents of table \"t\": the "
+	                                                 "table has branches other than main"));
+	REQUIRE_THAT(result->GetError(), !Catch::Contains("another engine"));
+	Query(test.connection, "ROLLBACK");
+	CheckRows(test.connection, {1, 2});
+	REQUIRE(Scalar(test.connection, "SELECT count(*) FROM iceberg_refs(lake.default.t)") == Value::BIGINT(2));
+	REQUIRE(Scalar(test.connection, "SELECT count(*) FROM iceberg_refs(lake.default.t) WHERE name = 'other'") ==
+	        Value::BIGINT(1));
+}
+
+TEST_CASE("Replacement contents are refused on a WAP branch before loading manifests", "[iceberg_replacement]") {
+	ReplacementTest test;
+	Query(test.connection, "BEGIN");
+	test.Replace();
+	Query(test.connection, "SET iceberg_wap_branch = 'audit'");
+	auto result = test.connection.Query("INSERT INTO lake.default.t VALUES (7)");
+	REQUIRE(result->HasError());
+	REQUIRE_THAT(result->GetError(),
+	             Catch::Contains("Cannot replace table \"t\" while writing to Iceberg branch 'audit'"));
+	Query(test.connection, "ROLLBACK");
+	Query(test.connection, "RESET iceberg_wap_branch");
+	CheckRows(test.connection, {1, 2});
+	REQUIRE(Scalar(test.connection, "SELECT count(*) FROM iceberg_refs(lake.default.t) WHERE name = 'audit'") ==
+	        Value::BIGINT(0));
+}
+
 TEST_CASE("Only DetachMain removes main", "[iceberg_replacement]") {
 	REQUIRE_THROWS_WITH(RemoveSnapshotRef("main"), Catch::Contains("DetachMain"));
 	REQUIRE(RemoveSnapshotRef("audit").ref_name == "audit");

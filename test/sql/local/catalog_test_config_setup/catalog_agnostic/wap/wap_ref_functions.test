@@ -1,0 +1,151 @@
+# name: test/sql/local/catalog_test_config_setup/catalog_agnostic/wap/wap_ref_functions.test
+# description: Ref functions under iceberg_wap_branch: those that name their ref ignore the setting, those that implicitly move main are refused, and a transaction never mixes row and ref changes of a table
+# group: [wap]
+
+require-env CATALOG_TEST_CONFIG_SETUP
+
+require-env TIMETRAVEL_SUPPORT
+
+include test/sql/init_requires
+
+require json
+
+statement ok
+DROP TABLE IF EXISTS my_datalake.default.wap_refs;
+
+statement ok
+CREATE TABLE my_datalake.default.wap_refs (id INTEGER);
+
+statement ok
+INSERT INTO my_datalake.default.wap_refs VALUES (1), (2);
+
+statement ok
+SET VARIABLE main_snapshot = (SELECT snapshot_id FROM iceberg_refs(my_datalake.default.wap_refs) WHERE name = 'main');
+
+statement ok
+SET iceberg_wap_branch = 'wap_ref_audit';
+
+# The branch can be created explicitly while the setting names it; without snapshot_id it starts at main's
+# current snapshot, as outside WAP
+query TTI
+SELECT ref_name, ref_type, snapshot_id = getvariable('main_snapshot')
+FROM iceberg_create_branch('my_datalake.default.wap_refs', 'wap_ref_audit');
+----
+wap_ref_audit	branch	true
+
+statement ok
+INSERT INTO my_datalake.default.wap_refs VALUES (3);
+
+statement ok
+SET VARIABLE audit_snapshot = (SELECT snapshot_id FROM iceberg_refs(my_datalake.default.wap_refs) WHERE name = 'wap_ref_audit');
+
+# The branch write left main where it was
+query II
+SELECT snapshot_id = getvariable('main_snapshot'), getvariable('audit_snapshot') != getvariable('main_snapshot')
+FROM iceberg_refs(my_datalake.default.wap_refs) WHERE name = 'main';
+----
+true	true
+
+# A tag created under the setting also defaults to main's current snapshot, not the WAP branch head
+query I
+SELECT snapshot_id = getvariable('main_snapshot') FROM iceberg_create_tag('my_datalake.default.wap_refs', 'wap_ref_v1');
+----
+true
+
+# set_current_snapshot and rollback always move main, so they are refused while the setting names another branch
+statement error
+SELECT * FROM iceberg_set_current_snapshot('my_datalake.default.wap_refs', ref := 'wap_ref_audit');
+----
+Cannot set the current snapshot of table "wap_refs" while 'iceberg_wap_branch' is set to 'wap_ref_audit': it moves main
+
+statement error
+SELECT * FROM iceberg_set_current_snapshot('my_datalake.default.wap_refs', snapshot_id := getvariable('main_snapshot'));
+----
+it moves main
+
+statement error
+SELECT * FROM iceberg_rollback_to_snapshot('my_datalake.default.wap_refs', getvariable('main_snapshot'));
+----
+rollback moves main
+
+# Rows and refs of one table do not change in one transaction, whichever comes first
+statement ok
+BEGIN;
+
+statement ok
+INSERT INTO my_datalake.default.wap_refs VALUES (4);
+
+statement error
+SELECT * FROM iceberg_create_tag('my_datalake.default.wap_refs', 'wap_ref_v2');
+----
+its rows were already changed in this transaction
+
+statement ok
+ROLLBACK;
+
+statement ok
+BEGIN;
+
+statement ok
+SELECT * FROM iceberg_create_tag('my_datalake.default.wap_refs', 'wap_ref_v2');
+
+statement error
+INSERT INTO my_datalake.default.wap_refs VALUES (4);
+----
+after changing its refs in the same transaction
+
+statement ok
+ROLLBACK;
+
+# Nothing from the refused transactions landed
+query III
+SELECT name, type, snapshot_id = getvariable('audit_snapshot') FROM iceberg_refs(my_datalake.default.wap_refs) ORDER BY name;
+----
+main	BRANCH	false
+wap_ref_audit	BRANCH	true
+wap_ref_v1	TAG	false
+
+# Publishing with fast_forward names both refs, so it works with the setting still set, and moves main only
+query TII
+SELECT branch_updated, previous_ref = getvariable('main_snapshot'), updated_ref = getvariable('audit_snapshot')
+FROM iceberg_fast_forward('my_datalake.default.wap_refs', 'main', 'wap_ref_audit');
+----
+main	true	true
+
+query I
+SELECT (metadata::JSON->>'current-snapshot-id')::BIGINT = getvariable('audit_snapshot')
+FROM iceberg_load_table_response(my_datalake.default.wap_refs);
+----
+true
+
+query I
+SELECT id FROM my_datalake.default.wap_refs AT (VERSION => 'main') ORDER BY id;
+----
+1
+2
+3
+
+# Dropping the WAP branch names it explicitly too; afterwards a read under the setting fails rather than fall back to main
+query TT
+SELECT ref_name, ref_type FROM iceberg_drop_branch('my_datalake.default.wap_refs', 'wap_ref_audit');
+----
+wap_ref_audit	branch
+
+statement error
+SELECT count(*) FROM my_datalake.default.wap_refs;
+----
+does not exist in this table
+
+statement ok
+RESET iceberg_wap_branch;
+
+query I
+SELECT count(*) FROM my_datalake.default.wap_refs;
+----
+3
+
+statement ok
+SELECT * FROM iceberg_drop_tag('my_datalake.default.wap_refs', 'wap_ref_v1');
+
+statement ok
+DROP TABLE my_datalake.default.wap_refs;

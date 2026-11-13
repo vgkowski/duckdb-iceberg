@@ -1,6 +1,7 @@
 #include "iceberg_options.hpp"
 #include "common/iceberg_utils.hpp"
 #include "duckdb/common/atomic.hpp"
+#include "duckdb/main/client_context.hpp"
 
 namespace duckdb {
 
@@ -84,6 +85,42 @@ void ValidateIcebergRefName(const string &name, const string &subject) {
 	if (name != ICEBERG_MAIN_BRANCH && StringUtil::CIEquals(name, ICEBERG_MAIN_BRANCH)) {
 		throw InvalidInputException("%s must be exactly 'main' to name main, got '%s'", subject, name);
 	}
+}
+
+void ValidateIcebergWapBranch(const string &branch) {
+	//! Empty means unset, which targets main
+	if (branch.empty()) {
+		return;
+	}
+	ValidateIcebergRefName(branch, StringUtil::Format("'%s'", WAP_BRANCH_CONFIG_VARIABLE));
+}
+
+bool GetIcebergWapBranchCreateMissing(ClientContext &context) {
+	Value value;
+	if (!context.TryGetCurrentSetting(WAP_BRANCH_CREATE_MISSING_CONFIG_VARIABLE, value) || value.IsNull()) {
+		return true;
+	}
+	return BooleanValue::Get(value.DefaultCastAs(LogicalType::BOOLEAN));
+}
+
+string GetIcebergWapBranch(ClientContext &context) {
+	Value value;
+	auto lookup = context.TryGetCurrentSetting(WAP_BRANCH_CONFIG_VARIABLE, value);
+	if (!lookup || value.IsNull()) {
+		return ICEBERG_MAIN_BRANCH;
+	}
+	auto branch = StringValue::Get(value);
+	if (lookup.GetScope() == SettingScope::GLOBAL && !branch.empty()) {
+		//! SET GLOBAL is refused; a value configured globally by other means must not redirect every session
+		throw InvalidConfigurationException("'%s' can only be set for the session, not globally",
+		                                    WAP_BRANCH_CONFIG_VARIABLE);
+	}
+	//! The setter validates too; re-check so a value set through another path can not slip through
+	ValidateIcebergWapBranch(branch);
+	if (branch.empty()) {
+		return ICEBERG_MAIN_BRANCH;
+	}
+	return branch;
 }
 
 IcebergOptions::IcebergOptions() : snapshot_lookup(IcebergSnapshotLookup::FromLatest()) {

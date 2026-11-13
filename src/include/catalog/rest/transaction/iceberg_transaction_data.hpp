@@ -30,6 +30,24 @@ struct IcebergRefMove {
 	int64_t updated_snapshot_id = 0;
 };
 
+struct IcebergTransactionData;
+
+//! The snapshot a read of a catalog table without an AT clause (or snapshot option) sees: the head of the session's
+//! iceberg_wap_branch, main when unset. Throws if 'transaction_data' targets another branch, or if the branch does
+//! not exist and this transaction is not creating it (a read never falls back to main).
+IcebergSnapshotScanInfo GetWapReadSnapshot(ClientContext &context, const IcebergTableMetadata &metadata,
+                                           optional_ptr<const IcebergTransactionData> transaction_data);
+
+//! The snapshot an explicit lookup (AT clause or snapshot option) of a catalog table selects. A branch that only
+//! 'transaction_data's pending changes create is read like a plain read of it under iceberg_wap_branch: its pending
+//! state (main's head plus the pending changes), rather than failing as a missing ref.
+IcebergSnapshotScanInfo GetLookupSnapshot(const IcebergTableMetadata &metadata, const IcebergSnapshotLookup &lookup,
+                                          optional_ptr<const IcebergTransactionData> transaction_data);
+
+//! A table created in this transaction has no branches until its first commit (to main), so a read of it under a
+//! non-main iceberg_wap_branch is refused with this error
+[[noreturn]] void ThrowWapReadOfCreatedTable(const string &table_name, const string &wap_branch);
+
 struct IcebergTransactionData {
 public:
 	IcebergTransactionData(ClientContext &context, IcebergTransaction &transaction, const IcebergTable &table_info);
@@ -50,10 +68,14 @@ public:
 
 	void AddSnapshot(IcebergSnapshotOperationType operation, vector<IcebergManifestEntry> &&data_files,
 	                 IcebergManifestDeletes &&altered_manifests, bool merge_action = false);
+	//! 'read_snapshot' is the snapshot the statement's scan of the table read the deleted rows from, when known: it
+	//! must be the head of the branch the statement commits to
 	void AddDeleteSnapshot(partitioned_manifest_entry_map_t &&delete_files, IcebergManifestDeletes &&altered_manifests,
-	                       bool merge_action = false);
+	                       bool merge_action = false,
+	                       optional_ptr<const IcebergSnapshotScanInfo> read_snapshot = nullptr);
 	void AddUpdateSnapshot(partitioned_manifest_entry_map_t &&delete_files, vector<IcebergManifestEntry> &&data_files,
-	                       IcebergManifestDeletes &&altered_manifests, bool merge_action = false);
+	                       IcebergManifestDeletes &&altered_manifests, bool merge_action = false,
+	                       optional_ptr<const IcebergSnapshotScanInfo> read_snapshot = nullptr);
 	// add a schema update for a table
 	void TableAddSchema(int32_t schema_id);
 	void TableSetCurrentSchema(int32_t schema_id);
@@ -89,10 +111,36 @@ public:
 	//! ancestry checks.
 	IcebergRefMove TableSetCurrentSnapshot(optional<int64_t> snapshot_id, const string &source_ref);
 
+	//! The branch this transaction's snapshots commit to: fixed by the first data-changing statement from
+	//! iceberg_wap_branch, "main" before that
+	const string &GetTargetBranch() const;
+	//! Throws if this transaction's snapshots target another branch than the session's iceberg_wap_branch, so a scan
+	//! never mixes the transaction's pending changes with another branch's state
+	void VerifyTargetBranch(const string &session_branch) const;
+	//! Whether a scan of 'snapshot' must include this transaction's pending changes: only for the head of the
+	//! branch they target, so a read of main never sees changes staged for a WAP branch and vice versa
+	bool IsVisibleIn(const IcebergSnapshotScanInfo &snapshot) const;
+	//! Whether this transaction's changes create 'branch' (it was missing when the first change was staged)
+	bool CreatesBranch(const string &branch) const;
+	//! Throws if the commit may not land on 'branch_head' of 'metadata': the target branch was deleted (or is missing
+	//! while creating branches is disabled), or the commit's first snapshot would have no parent while the table
+	//! already has snapshots. Checked on every attempt against the refreshed metadata, so a retry never recreates a
+	//! deleted branch.
+	void VerifyCommitBranch(const IcebergTableMetadata &metadata, const IcebergBranchHead &branch_head) const;
+
 private:
 	//! Ref changes are validated against the pre-transaction refs, so they cannot follow row changes or
 	//! another change to the same ref.
 	void VerifyCanChangeRef(const string &ref_name) const;
+	//! A snapshot without a parent is only committed to a table with no branch other than main, and never creates a
+	//! branch: catalogs exempt such a snapshot from the sequence-number check (see the definition)
+	[[noreturn]] void ThrowParentlessCommit(const string &branch, bool table_has_other_branches) const;
+	//! Fix the target branch from iceberg_wap_branch on the first data-changing statement; later ones must agree.
+	//! Called with lock held.
+	void BindTargetBranch(lock_guard<mutex> &guard);
+	//! Throws unless 'read_snapshot' (if given) is the head of the bound target branch: the scan resolved its branch
+	//! at bind, the target at execution, and the two must agree. Called with lock held, after BindTargetBranch.
+	void VerifyReadBranch(lock_guard<mutex> &guard, optional_ptr<const IcebergSnapshotScanInfo> read_snapshot) const;
 	void CacheExistingManifestList(lock_guard<mutex> &guard, const IcebergTableMetadata &metadata);
 	//! Retains one pending delete manifest per partition spec present in 'delete_files'.
 	void AddPendingDeleteManifests(IcebergAddSnapshot &add_snapshot, partitioned_manifest_entry_map_t &&delete_files);
@@ -150,6 +198,13 @@ public:
 	//! Refs created, moved or removed by this transaction (exact names; main when rolled back).
 	//! Each ref may change once: later validation would otherwise see the pre-transaction state.
 	unordered_set<string> modified_refs;
+	//! Branch the snapshots commit to, see GetTargetBranch
+	string target_branch = "main";
+	bool target_branch_bound = false;
+	//! Whether the target branch existed when it was bound; if so a commit never recreates it from main
+	bool target_branch_existed = true;
+	//! iceberg_wap_branch_create_missing when the target branch was bound
+	bool may_create_branch = true;
 	mutable mutex lock;
 };
 

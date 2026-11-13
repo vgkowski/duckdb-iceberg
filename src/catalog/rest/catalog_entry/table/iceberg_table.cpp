@@ -688,7 +688,8 @@ optional_ptr<CatalogEntry> IcebergTable::GetSchemaVersion(optional_ptr<BoundAtCl
 	} else {
 		D_ASSERT(!schema_versions.empty());
 		auto snapshot_lookup = IcebergSnapshotLookup::FromAtClause(at);
-		auto snapshot_info = GetMetadata().GetSnapshot(snapshot_lookup);
+		//! A branch this transaction is creating resolves like the scan will (its pending state, current schema)
+		auto snapshot_info = GetLookupSnapshot(GetMetadata(), snapshot_lookup, transaction_data.get());
 		//! GetSnapshot picks the schema per source: current for latest and branches, the snapshot's for ids,
 		//! timestamps and tags
 		schema_id = snapshot_info.snapshot ? snapshot_info.schema_id : GetMetadata().GetCurrentSchemaId();

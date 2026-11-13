@@ -1,0 +1,76 @@
+# name: test/sql/local/catalog_test_config_setup/catalog_specifc/fixture/wap_branch_race.test
+# description: A branch commit raced by a main commit is rejected by apache/iceberg-rest-fixture, and the table's last-sequence-number stays monotonic
+# group: [fixture]
+
+# Iceberg's TableMetadata.Builder.addSnapshot rejects a snapshot with a parent whose sequence number is not above the
+# table's last-sequence-number (server-side, apache-iceberg-1.10.1,
+# core/src/main/java/org/apache/iceberg/TableMetadata.java:1250-1259). The branch's assert-ref-snapshot-id holds, so
+# servers before Iceberg 1.11 answer a 400 ValidationException (apache/iceberg#15001), and 1.11 or later a 409
+# CommitFailedException (apache/iceberg#15126, server-side). This runs on the fixture lane (1.10.1) and the
+# fixture-latest lane (test/configs/fixture-latest.json), so it races an UPDATE, which is never retried: both servers
+# reject it, quoting the same Java message. (An append would be retried on the 409.)
+
+require-env CATALOG_TEST_CONFIG_SETUP fixture
+
+include test/sql/init_requires
+
+require json
+
+statement ok
+DROP TABLE IF EXISTS my_datalake.default.wap_race;
+
+statement ok
+CREATE TABLE my_datalake.default.wap_race (id INTEGER);
+
+statement ok
+INSERT INTO my_datalake.default.wap_race VALUES (1);
+
+statement ok con1
+SET iceberg_wap_branch = 'wap_race_audit';
+
+# Creates the branch from main with sequence number 2
+statement ok con1
+INSERT INTO my_datalake.default.wap_race VALUES (10);
+
+statement ok con1
+BEGIN;
+
+# Staged on last-sequence-number 2, so its snapshot is stamped 3
+statement ok con1
+UPDATE my_datalake.default.wap_race SET id = 11 WHERE id = 10;
+
+# Main's commit takes sequence number 3 first
+statement ok
+INSERT INTO my_datalake.default.wap_race VALUES (2);
+
+statement error con1
+COMMIT;
+----
+<REGEX>:.*Cannot add snapshot with sequence number 3 older than last sequence number 3.*
+
+statement ok con1
+RESET iceberg_wap_branch;
+
+# Nothing of the branch commit landed
+query I
+SELECT id FROM my_datalake.default.wap_race AT (VERSION => 'wap_race_audit') ORDER BY id;
+----
+1
+10
+
+query I
+SELECT id FROM my_datalake.default.wap_race ORDER BY id;
+----
+1
+2
+
+query III
+SELECT count(*), count(DISTINCT sequence_number), max(sequence_number) = (
+	SELECT (metadata::JSON->>'last-sequence-number')::BIGINT FROM iceberg_load_table_response(my_datalake.default.wap_race)
+)
+FROM iceberg_snapshots(my_datalake.default.wap_race);
+----
+3	3	true
+
+statement ok
+DROP TABLE my_datalake.default.wap_race;

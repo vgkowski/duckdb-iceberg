@@ -583,8 +583,32 @@ void Catalog::Apply(Json &metadata, const Json &update, map<string, int64_t> &la
 				Invalid("Snapshot ID already exists");
 			}
 		}
+		//! As Iceberg's TableMetadata.Builder.addSnapshot: format v1 and parent-less snapshots are exempt
+		bool sequence_checked =
+		    metadata.At("format-version").Integer() != 1 && !snapshot.Get("parent-snapshot-id").IsNull();
+		if (sequence_checked &&
+		    snapshot.At("sequence-number").Integer() <= metadata.At("last-sequence-number").Integer()) {
+			//! Same text and status as Iceberg's TableMetadata.Builder.addSnapshot, server-side (apache-iceberg-1.10.1,
+			//! core/src/main/java/org/apache/iceberg/TableMetadata.java:1250-1259; iceberg-rest-fixture 1.10.1 answers
+			//! a 400 ValidationException), also when a commit to another branch advanced last-sequence-number
+			//! (apache/iceberg#15001)
+			throw CatalogError(400, "ValidationException",
+			                   "Cannot add snapshot with sequence number " +
+			                       std::to_string(snapshot.At("sequence-number").Integer()) +
+			                       " older than last sequence number " +
+			                       std::to_string(metadata.At("last-sequence-number").Integer()));
+		}
+		//! Stricter than Java on purpose: Java adopts an exempt (parent-less or v1) snapshot's sequence number as
+		//! last-sequence-number even when it is not above it (server-side, apache-iceberg-1.10.1,
+		//! core/src/main/java/org/apache/iceberg/TableMetadata.java:1250-1259). A client that stamped such a snapshot
+		//! from stale metadata would then lower or repeat last-sequence-number, and later deletes would not apply to
+		//! newer data files. Refusing it here makes the test suite catch that client bug instead of losing deletes.
 		if (snapshot.At("sequence-number").Integer() <= metadata.At("last-sequence-number").Integer()) {
-			Invalid("Snapshot sequence number must increase");
+			throw CatalogError(400, "ValidationException",
+			                   "Mock catalog refuses a sequence number " +
+			                       std::to_string(snapshot.At("sequence-number").Integer()) +
+			                       " that is not above last-sequence-number " +
+			                       std::to_string(metadata.At("last-sequence-number").Integer()));
 		}
 		if (!snapshot.Get("parent-snapshot-id").IsNull()) {
 			FindID(metadata.At("snapshots"), "snapshot-id", snapshot.At("parent-snapshot-id").Integer());
@@ -645,12 +669,17 @@ void Catalog::Apply(Json &metadata, const Json &update, map<string, int64_t> &la
 				Invalid(string("Tags do not support ") + field);
 			}
 		}
+		auto &refs = metadata.At("refs");
+		// Mock strictness: a set-snapshot-ref never turns a branch into a tag or back
+		if (refs.Has(ref_name) && refs.At(ref_name).At("type").String() != type) {
+			Invalid("Cannot change the type of ref " + ref_name);
+		}
 		auto ref = update;
 		ref.Erase("action");
 		ref.Erase("ref-name");
-		metadata.At("refs")[ref_name] = std::move(ref);
+		refs[ref_name] = std::move(ref);
 		if (ref_name != "main") {
-			// Only main determines the current snapshot and its history.
+			// Other refs only point at a snapshot; they never move current-snapshot-id or the snapshot-log
 			return;
 		}
 		if (metadata.Get("current-snapshot-id") != update.At("snapshot-id")) {

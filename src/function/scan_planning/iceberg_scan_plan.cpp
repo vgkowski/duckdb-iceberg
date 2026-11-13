@@ -2,6 +2,7 @@
 
 #include "catalog/rest/catalog_entry/table/iceberg_table.hpp"
 #include "catalog/rest/catalog_entry/table/iceberg_table_schema_version.hpp"
+#include "catalog/rest/transaction/iceberg_transaction_data.hpp"
 #include "common/iceberg_utils.hpp"
 #include "core/metadata/partition/iceberg_partition_constants.hpp"
 #include "duckdb/common/types/vector.hpp"
@@ -119,13 +120,21 @@ static unique_ptr<FunctionData> IcebergScanPlanBind(ClientContext &context, Tabl
 			                            "file credentials; query the table directly",
 			                            input_string);
 		}
-		auto snapshot = metadata.GetSnapshot(*options.snapshot_lookup);
+		IcebergSnapshotScanInfo snapshot;
+		if (options.snapshot_lookup->IsLatest()) {
+			//! Plan what a plain read of the table sees: the session's WAP branch, or main
+			snapshot = GetWapReadSnapshot(context, metadata, table_entry->table_info.transaction_data.get());
+		} else {
+			snapshot =
+			    GetLookupSnapshot(metadata, *options.snapshot_lookup, table_entry->table_info.transaction_data.get());
+		}
 		auto &schema = metadata.GetSchemaFromId(snapshot.schema_id);
 		auto &fs = FileSystem::GetFileSystem(context);
 		scan_info = make_shared_ptr<IcebergScanInfo>(
 		    metadata.GetMetadataPath(fs), table_entry->table_info.GetMetadataOwner(), snapshot, schema,
 		    IcebergFileSecret("", std::to_string(table_entry->catalog.GetOid())));
-		if (snapshot.is_transaction_head && table_entry->table_info.transaction_data) {
+		if (table_entry->table_info.transaction_data &&
+		    table_entry->table_info.transaction_data->IsVisibleIn(snapshot)) {
 			scan_info->transaction_data = table_entry->table_info.transaction_data.get();
 		}
 	} else {

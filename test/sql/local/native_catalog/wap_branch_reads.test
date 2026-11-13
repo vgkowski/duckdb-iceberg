@@ -1,0 +1,309 @@
+# name: test/sql/local/native_catalog/wap_branch_reads.test
+# description: iceberg_wap_branch never reads main in place of a missing branch, and keeps pending changes on the branch they target
+# group: [native_catalog]
+
+require-env CATALOG_TEST_CONFIG_SETUP mock
+
+include test/sql/init_requires
+
+require json
+
+# ---------------------------------------------------------------------------
+# A missing branch is never read as main
+
+statement ok
+CREATE TABLE my_datalake.default.wap_safe (id INTEGER);
+
+statement ok
+INSERT INTO my_datalake.default.wap_safe VALUES (1), (2);
+
+statement ok
+SET VARIABLE main_1 = (SELECT snapshot_id FROM iceberg_refs(my_datalake.default.wap_safe) WHERE name = 'main');
+
+statement ok
+SET iceberg_wap_branch = 'audit';
+
+statement error
+SELECT count(*) FROM my_datalake.default.wap_safe;
+----
+Iceberg branch 'audit' (set by 'iceberg_wap_branch') does not exist
+
+statement error
+SELECT count(*) FROM iceberg_scan_plan('my_datalake.default.wap_safe');
+----
+Iceberg branch 'audit' (set by 'iceberg_wap_branch') does not exist
+
+statement error
+SELECT count(*) FROM iceberg_files(my_datalake.default.wap_safe);
+----
+Iceberg branch 'audit' (set by 'iceberg_wap_branch') does not exist
+
+statement error
+SELECT count(*) FROM iceberg_metadata(my_datalake.default.wap_safe);
+----
+Iceberg branch 'audit' (set by 'iceberg_wap_branch') does not exist
+
+# DELETE, UPDATE and MERGE read the branch first
+statement error
+DELETE FROM my_datalake.default.wap_safe WHERE id = 1;
+----
+Iceberg branch 'audit' (set by 'iceberg_wap_branch') does not exist
+
+# Main stays readable explicitly
+query I
+SELECT count(*) FROM my_datalake.default.wap_safe AT (VERSION => 'main');
+----
+2
+
+# Strict mode refuses to create the branch
+statement ok
+SET iceberg_wap_branch_create_missing = false;
+
+statement error
+INSERT INTO my_datalake.default.wap_safe VALUES (3);
+----
+does not exist in table "wap_safe", and 'iceberg_wap_branch_create_missing' is false
+
+query I
+SELECT count(*) FROM iceberg_refs(my_datalake.default.wap_safe) WHERE name = 'audit';
+----
+0
+
+statement ok
+RESET iceberg_wap_branch_create_missing;
+
+# A transaction that creates the branch reads its pending state
+statement ok
+BEGIN;
+
+statement ok
+INSERT INTO my_datalake.default.wap_safe VALUES (3);
+
+query I
+SELECT id FROM my_datalake.default.wap_safe ORDER BY id;
+----
+1
+2
+3
+
+# An explicit read of main does not see changes staged for the branch
+query I
+SELECT id FROM my_datalake.default.wap_safe AT (VERSION => 'main') ORDER BY id;
+----
+1
+2
+
+# An explicit read of the branch being created reads its pending state, like a plain read
+query I
+SELECT id FROM my_datalake.default.wap_safe AT (VERSION => 'audit') ORDER BY id;
+----
+1
+2
+3
+
+# Main's data file and the pending one
+query I
+SELECT count(*) FROM iceberg_scan_plan('my_datalake.default.wap_safe', snapshot_from_ref => 'audit');
+----
+2
+
+statement ok
+COMMIT;
+
+# iceberg_scan and metadata functions do not include pending changes, so they refuse a branch the transaction is
+# creating rather than show main's data under its name
+statement ok
+SET iceberg_wap_branch = 'audit_pending';
+
+statement ok
+BEGIN;
+
+statement ok
+INSERT INTO my_datalake.default.wap_safe VALUES (7);
+
+statement error
+SELECT count(*) FROM iceberg_scan('my_datalake.default.wap_safe');
+----
+Iceberg branch 'audit_pending' of table "wap_safe" is created by this transaction
+
+statement ok
+ROLLBACK;
+
+statement ok
+BEGIN;
+
+statement ok
+INSERT INTO my_datalake.default.wap_safe VALUES (7);
+
+statement error
+SELECT count(*) FROM iceberg_files(my_datalake.default.wap_safe);
+----
+Iceberg branch 'audit_pending' of table "wap_safe" is created by this transaction
+
+statement ok
+ROLLBACK;
+
+# ... also when the branch is named by a snapshot option
+statement ok
+BEGIN;
+
+statement ok
+INSERT INTO my_datalake.default.wap_safe VALUES (7);
+
+statement error
+SELECT count(*) FROM iceberg_files(my_datalake.default.wap_safe, snapshot_from_ref => 'audit_pending');
+----
+Iceberg branch 'audit_pending' of table "wap_safe" is created by this transaction
+
+statement ok
+ROLLBACK;
+
+# A branch this transaction does not create is still missing
+statement ok
+BEGIN;
+
+statement ok
+INSERT INTO my_datalake.default.wap_safe VALUES (7);
+
+statement error
+SELECT count(*) FROM my_datalake.default.wap_safe AT (VERSION => 'audit_other');
+----
+Iceberg ref 'audit_other' does not exist
+
+statement ok
+ROLLBACK;
+
+query I
+SELECT count(*) FROM iceberg_refs(my_datalake.default.wap_safe) WHERE name = 'audit_pending';
+----
+0
+
+statement ok
+SET iceberg_wap_branch = 'audit';
+
+statement ok
+SET VARIABLE audit_1 = (SELECT snapshot_id FROM iceberg_refs(my_datalake.default.wap_safe) WHERE name = 'audit');
+
+# Strict mode still writes to an existing branch
+statement ok
+SET iceberg_wap_branch_create_missing = false;
+
+statement ok
+INSERT INTO my_datalake.default.wap_safe VALUES (4);
+
+statement ok
+RESET iceberg_wap_branch_create_missing;
+
+# Pending changes are visible exactly on the branch they target
+statement ok
+BEGIN;
+
+statement ok
+INSERT INTO my_datalake.default.wap_safe VALUES (5);
+
+query I
+SELECT count(*) FROM my_datalake.default.wap_safe;
+----
+5
+
+query I
+SELECT count(*) FROM my_datalake.default.wap_safe AT (VERSION => 'audit');
+----
+5
+
+query I
+SELECT count(*) FROM my_datalake.default.wap_safe AT (VERSION => 'main');
+----
+2
+
+statement ok
+COMMIT;
+
+statement ok
+RESET iceberg_wap_branch;
+
+statement ok
+BEGIN;
+
+statement ok
+INSERT INTO my_datalake.default.wap_safe VALUES (100);
+
+query I
+SELECT count(*) FROM my_datalake.default.wap_safe;
+----
+3
+
+query I
+SELECT count(*) FROM my_datalake.default.wap_safe AT (VERSION => 'main');
+----
+3
+
+query I
+SELECT count(*) FROM my_datalake.default.wap_safe AT (VERSION => 'audit');
+----
+5
+
+statement ok
+COMMIT;
+
+# Metadata functions, iceberg_scan and iceberg_scan_plan read the WAP branch unless a snapshot option is given
+statement ok
+SET iceberg_wap_branch = 'audit';
+
+query I
+SELECT count(*) FROM iceberg_files(my_datalake.default.wap_safe);
+----
+4
+
+query I
+SELECT count(*) FROM iceberg_files(my_datalake.default.wap_safe, snapshot_from_ref => 'main');
+----
+2
+
+query I
+SELECT count(*) FROM iceberg_metadata(my_datalake.default.wap_safe);
+----
+4
+
+query I
+SELECT count(*) FROM iceberg_manifests(my_datalake.default.wap_safe);
+----
+4
+
+query I
+SELECT count(*) FROM iceberg_scan('my_datalake.default.wap_safe');
+----
+5
+
+query I
+SELECT count(*) FROM iceberg_scan_plan('my_datalake.default.wap_safe');
+----
+4
+
+query I
+SELECT count(*) FROM iceberg_scan_plan('my_datalake.default.wap_safe', snapshot_from_ref => 'main');
+----
+2
+
+# Rollback and rewrite move main, so they are refused while a branch is targeted
+statement error
+SELECT * FROM iceberg_rollback_to_snapshot('my_datalake.default.wap_safe', getvariable('main_1'));
+----
+rollback moves main
+
+statement error
+SELECT * FROM iceberg_rewrite_data_files('my_datalake.default.wap_safe', rewrite_all := true);
+----
+Cannot rewrite data files of table "wap_safe" while 'iceberg_wap_branch' is set to 'audit'
+
+statement ok
+RESET iceberg_wap_branch;
+
+query I
+SELECT count(*) FROM my_datalake.default.wap_safe;
+----
+3
+
+statement ok
+DROP TABLE my_datalake.default.wap_safe;
+

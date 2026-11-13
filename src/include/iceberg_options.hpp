@@ -7,6 +7,8 @@
 
 namespace duckdb {
 
+class ClientContext;
+
 static constexpr const char *VERSION_GUESSING_CONFIG_VARIABLE = "unsafe_enable_version_guessing";
 static constexpr const char *ENABLE_MANIFEST_CACHE_CONFIG_VARIABLE = "iceberg_enable_manifest_cache";
 
@@ -50,12 +52,25 @@ static constexpr const char *SKIP_PUFFIN_VERIFICATION_CONFIG_VARIABLE = "iceberg
 // the equality-delete read path.
 static constexpr const char *ENABLE_EQUALITY_DELETES_CONFIG_VARIABLE = "__iceberg_unsafe_enable_equality_deletes";
 
+// Write-Audit-Publish branch, as Spark's 'spark.wap.branch'. When set (and not 'main'), data-changing statements
+// on REST catalog tables commit to this branch instead of main, and reads of those tables without an AT clause read
+// the branch. A missing branch is created by the first commit, based on main's current snapshot.
+static constexpr const char *WAP_BRANCH_CONFIG_VARIABLE = "iceberg_wap_branch";
 static constexpr const char *ICEBERG_MAIN_BRANCH = "main";
 static constexpr idx_t MAX_ICEBERG_REF_NAME_LENGTH = 255;
 
-//! Throws if 'name' is not acceptable as the name of a ref this extension creates (a new branch or tag).
-//! 'subject' starts each error message, e.g. "Iceberg ref name".
+//! Throws if 'name' is not acceptable as the name of a ref this extension creates or writes to (a new branch or
+//! tag, or the WAP branch). 'subject' starts each error message, e.g. "Iceberg ref name".
 void ValidateIcebergRefName(const string &name, const string &subject);
+//! Throws if 'branch' is not acceptable as iceberg_wap_branch. The empty string (unset) is accepted.
+void ValidateIcebergWapBranch(const string &branch);
+//! The validated iceberg_wap_branch of this session; "main" when the setting is unset
+string GetIcebergWapBranch(ClientContext &context);
+
+// Whether a write under iceberg_wap_branch may create a missing branch from main (as Spark does). Set to false so a
+// mistyped branch name fails instead of creating a new branch.
+static constexpr const char *WAP_BRANCH_CREATE_MISSING_CONFIG_VARIABLE = "iceberg_wap_branch_create_missing";
+bool GetIcebergWapBranchCreateMissing(ClientContext &context);
 
 static constexpr const char *UNSAFE_STRUCT_NULL_DEFAULT_INTERP_CONFIG_VARIABLE =
     "__iceberg_unsafe_struct_null_default_interp";

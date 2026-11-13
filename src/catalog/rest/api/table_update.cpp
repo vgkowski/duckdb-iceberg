@@ -344,9 +344,11 @@ void SetSnapshotRef::CreateUpdate(DatabaseInstance &db, ClientContext &context,
 				//! (TableMetadata.java:1306-1340, via MetadataUpdate.java:418-425), which does not check this, so the
 				//! client must refuse instead of sending set-snapshot-ref with type tag.
 				if (snapshot_reference.type != "branch") {
-					throw InvalidConfigurationException(
-					    "Cannot move Iceberg ref '%s' of table \"%s\": it is not a branch", ref_name,
-					    commit_state.table_info.name);
+					//! Raised while staging a commit attempt, before anything of it is sent
+					ThrowCommitRefusal(ExceptionType::INVALID_CONFIGURATION,
+					                   StringUtil::Format("Cannot move Iceberg ref '%s' of table \"%s\": it is not a "
+					                                      "branch",
+					                                      ref_name, commit_state.table_info.name));
 				}
 			}
 		}

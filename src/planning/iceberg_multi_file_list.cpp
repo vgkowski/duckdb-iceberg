@@ -72,7 +72,7 @@ void IcebergMultiFileList::Bind(vector<LogicalType> &return_types, vector<Identi
 		auto resolved_metadata =
 		    IcebergUtils::ResolveTableMetadata(planner->GetContext(), planner->GetPath(), planner->GetOptions());
 		auto &metadata = *resolved_metadata.metadata;
-		auto snapshot_info = metadata.GetSnapshot(*planner->GetOptions().snapshot_lookup);
+		auto snapshot_info = resolved_metadata.GetSnapshot(metadata, *planner->GetOptions().snapshot_lookup);
 		auto &schema = metadata.GetSchemaFromId(snapshot_info.schema_id);
 		planner->SetScanInfo(make_shared_ptr<IcebergScanInfo>(resolved_metadata.table_location,
 		                                                      std::move(resolved_metadata.metadata), snapshot_info,

@@ -1,0 +1,275 @@
+# name: test/sql/local/native_catalog/wap_branch_conflicts.test
+# description: iceberg_wap_branch commits assert the target branch, retry appends onto its new head and leave main alone
+# group: [native_catalog]
+
+require-env CATALOG_TEST_CONFIG_SETUP mock
+
+include test/sql/init_requires
+
+statement ok
+CREATE TABLE my_datalake.default.wap_conflicts (id INTEGER);
+
+statement ok
+INSERT INTO my_datalake.default.wap_conflicts VALUES (1);
+
+statement ok
+SET VARIABLE main_snapshot = (
+	SELECT snapshot_id FROM iceberg_refs(my_datalake.default.wap_conflicts) WHERE name = 'main'
+);
+
+statement ok con1
+SET iceberg_wap_branch = 'audit';
+
+statement ok con2
+SET iceberg_wap_branch = 'audit';
+
+# Two writers create the same branch: the second commit fails the branch-absent assertion and its append is retried
+# onto the branch the first one created
+statement ok con1
+BEGIN;
+
+statement ok con1
+INSERT INTO my_datalake.default.wap_conflicts VALUES (2);
+
+statement ok con2
+INSERT INTO my_datalake.default.wap_conflicts VALUES (3);
+
+statement ok con1
+COMMIT;
+
+query I con1
+SELECT id FROM my_datalake.default.wap_conflicts ORDER BY id;
+----
+1
+2
+3
+
+# Appends to an existing branch are retried onto its new head
+statement ok con1
+BEGIN;
+
+statement ok con1
+INSERT INTO my_datalake.default.wap_conflicts VALUES (4);
+
+statement ok con2
+INSERT INTO my_datalake.default.wap_conflicts VALUES (5);
+
+statement ok con1
+COMMIT;
+
+query I con2
+SELECT count(*) FROM my_datalake.default.wap_conflicts;
+----
+5
+
+# A DELETE is not re-applied over a concurrent commit to its branch
+statement ok con1
+BEGIN;
+
+statement ok con1
+DELETE FROM my_datalake.default.wap_conflicts WHERE id = 1;
+
+statement ok con2
+INSERT INTO my_datalake.default.wap_conflicts VALUES (6);
+
+statement error con1
+COMMIT;
+----
+conflicts with a concurrent commit
+
+# A commit to main between the branch statement and its commit advances the table-wide last-sequence-number. The
+# branch's assert-ref-snapshot-id holds, so the catalog rejects the stale sequence number with a 400 (as Iceberg's
+# TableMetadata.Builder.addSnapshot, server-side, before Iceberg 1.11: apache/iceberg#15001), reported as is
+statement ok con1
+BEGIN;
+
+statement ok con1
+DELETE FROM my_datalake.default.wap_conflicts WHERE id = 1;
+
+statement ok
+INSERT INTO my_datalake.default.wap_conflicts VALUES (100);
+
+statement error con1
+COMMIT;
+----
+Cannot add snapshot with sequence number 7 older than last sequence number 7
+
+statement ok con1
+UPDATE my_datalake.default.wap_conflicts SET id = id + 10 WHERE id = 2;
+
+query I con1
+SELECT id FROM my_datalake.default.wap_conflicts ORDER BY id;
+----
+1
+3
+4
+5
+6
+12
+
+query I
+SELECT id FROM my_datalake.default.wap_conflicts ORDER BY id;
+----
+1
+100
+
+# Neither branch commit moved main
+query I
+SELECT parent_id = getvariable('main_snapshot') FROM iceberg_snapshots(my_datalake.default.wap_conflicts)
+WHERE snapshot_id = (SELECT snapshot_id FROM iceberg_refs(my_datalake.default.wap_conflicts) WHERE name = 'main');
+----
+true
+
+statement ok
+DROP TABLE my_datalake.default.wap_conflicts;
+
+# A branch is never created while main has no snapshot: its first snapshot would have no parent, which Java catalogs
+# exempt from the sequence-number check, so a stale staged number would not be above last-sequence-number
+statement ok
+CREATE TABLE my_datalake.default.wap_parentless (id INTEGER);
+
+statement error con1
+INSERT INTO my_datalake.default.wap_parentless VALUES (1);
+----
+Cannot create Iceberg branch 'audit' of table "wap_parentless": main has no snapshot yet
+
+statement ok con1
+BEGIN;
+
+statement error con1
+INSERT INTO my_datalake.default.wap_parentless VALUES (1);
+----
+Insert into main first
+
+statement ok con1
+ROLLBACK;
+
+# Commits to main, then a DELETE on main: the deleted row stays deleted and sequence numbers only grow
+statement ok
+INSERT INTO my_datalake.default.wap_parentless VALUES (1);
+
+statement ok
+INSERT INTO my_datalake.default.wap_parentless VALUES (2);
+
+statement ok
+INSERT INTO my_datalake.default.wap_parentless VALUES (3);
+
+statement ok
+DELETE FROM my_datalake.default.wap_parentless WHERE id = 3;
+
+query I
+SELECT id FROM my_datalake.default.wap_parentless ORDER BY id;
+----
+1
+2
+
+query I
+SELECT count(*) FROM iceberg_refs(my_datalake.default.wap_parentless) WHERE name = 'audit';
+----
+0
+
+statement ok
+DROP TABLE my_datalake.default.wap_parentless;
+
+# A commit that creates a branch asserts main at the snapshot the branch starts from. Main moved twice, so the first
+# attempt fails that assertion with a 409, and the append is retried onto main's new head: it never lowers or repeats
+# the table's last-sequence-number, and a later DELETE on main covers every row it should
+statement ok
+CREATE TABLE my_datalake.default.wap_seq (id INTEGER);
+
+statement ok
+INSERT INTO my_datalake.default.wap_seq VALUES (1);
+
+statement ok con1
+BEGIN;
+
+statement ok con1
+INSERT INTO my_datalake.default.wap_seq VALUES (10);
+
+statement ok
+INSERT INTO my_datalake.default.wap_seq VALUES (2);
+
+statement ok
+INSERT INTO my_datalake.default.wap_seq VALUES (3);
+
+statement ok
+SET VARIABLE moved_main = (SELECT snapshot_id FROM iceberg_refs(my_datalake.default.wap_seq) WHERE name = 'main');
+
+statement ok con1
+COMMIT;
+
+# The branch starts from main's new head, and main did not move
+query II
+SELECT
+	(SELECT parent_id FROM iceberg_snapshots(my_datalake.default.wap_seq) WHERE snapshot_id = (
+		SELECT snapshot_id FROM iceberg_refs(my_datalake.default.wap_seq) WHERE name = 'audit'
+	)) = getvariable('moved_main'),
+	(SELECT snapshot_id FROM iceberg_refs(my_datalake.default.wap_seq) WHERE name = 'main') = getvariable('moved_main');
+----
+true	true
+
+query I con1
+SELECT id FROM my_datalake.default.wap_seq ORDER BY id;
+----
+1
+2
+3
+10
+
+statement ok
+DELETE FROM my_datalake.default.wap_seq WHERE id = 3;
+
+query I
+SELECT id FROM my_datalake.default.wap_seq ORDER BY id;
+----
+1
+2
+
+query III
+SELECT count(*), count(DISTINCT sequence_number), max(sequence_number) FROM iceberg_snapshots(my_datalake.default.wap_seq);
+----
+5	5	5
+
+statement ok
+DROP TABLE my_datalake.default.wap_seq;
+
+# Without retries, the failed main assertion aborts the branch-creating commit: no branch, main unchanged
+statement ok
+CREATE TABLE my_datalake.default.wap_create_no_retry (id INTEGER) WITH ('commit.retry.num-retries' = '0');
+
+statement ok
+INSERT INTO my_datalake.default.wap_create_no_retry VALUES (1);
+
+statement ok con1
+BEGIN;
+
+statement ok con1
+INSERT INTO my_datalake.default.wap_create_no_retry VALUES (10);
+
+statement ok
+INSERT INTO my_datalake.default.wap_create_no_retry VALUES (2);
+
+statement ok
+SET VARIABLE moved_main = (
+	SELECT snapshot_id FROM iceberg_refs(my_datalake.default.wap_create_no_retry) WHERE name = 'main'
+);
+
+statement error con1
+COMMIT;
+----
+Requirement failed: assert-ref-snapshot-id
+
+query II
+SELECT count(*) FILTER (name = 'audit'), bool_and(snapshot_id = getvariable('moved_main')) FILTER (name = 'main')
+FROM iceberg_refs(my_datalake.default.wap_create_no_retry);
+----
+0	true
+
+query I
+SELECT id FROM my_datalake.default.wap_create_no_retry ORDER BY id;
+----
+1
+2
+
+statement ok
+DROP TABLE my_datalake.default.wap_create_no_retry;

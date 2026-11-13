@@ -674,9 +674,17 @@ void IcebergDelete::AddDeleteSnapshot(ClientContext &context, IcebergDeleteGloba
 		ApplyTableUpdate(table.table_info, iceberg_transaction, [&](IcebergTable &tbl) {
 			auto &transaction_data = tbl.GetOrCreateTransactionData(iceberg_transaction);
 			transaction_data.AddDeleteSnapshot(std::move(iceberg_delete_files),
-			                                   std::move(global_state.write_result.altered_manifests), merge_action);
+			                                   std::move(global_state.write_result.altered_manifests), merge_action,
+			                                   GetReadSnapshot());
 		});
 	}
+}
+
+optional_ptr<const IcebergSnapshotScanInfo> IcebergDelete::GetReadSnapshot() const {
+	if (!multi_file_list) {
+		return nullptr;
+	}
+	return &multi_file_list->GetScanPlanner().GetSnapshot();
 }
 
 //===--------------------------------------------------------------------===//

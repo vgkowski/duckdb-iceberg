@@ -98,7 +98,8 @@ static unique_ptr<FunctionData> IcebergFilesBind(ClientContext &context, TableFu
 	bind_data->table_location = std::move(resolved_metadata.table_location);
 	bind_data->metadata = std::move(resolved_metadata.metadata);
 	bind_data->file_secret = std::move(resolved_metadata.file_secret);
-	bind_data->snapshot_to_scan = bind_data->metadata->GetSnapshot(*bind_data->options.snapshot_lookup);
+	bind_data->snapshot_to_scan =
+	    resolved_metadata.GetSnapshot(*bind_data->metadata, *bind_data->options.snapshot_lookup);
 	bind_data->partition_fields = IcebergPartitionStruct::GetFields(*bind_data->metadata);
 	for (auto &column : bind_data->metadata->GetLatestSchema().columns) {
 		GetMetricsFields(*column, "", bind_data->metrics_fields);

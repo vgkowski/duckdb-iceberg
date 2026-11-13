@@ -262,6 +262,79 @@ optional_ptr<const IcebergSnapshot> IcebergTableMetadata::GetSnapshotByRef(const
 	return snapshot;
 }
 
+bool IcebergBranchHead::IsMain() const {
+	return branch == ICEBERG_MAIN_BRANCH;
+}
+
+IcebergBranchHead IcebergTableMetadata::GetBranchHead(const string &branch) const {
+	IcebergBranchHead head;
+	head.branch = branch.empty() ? string(ICEBERG_MAIN_BRANCH) : branch;
+	if (head.IsMain()) {
+		head.ref_snapshot = GetLatestSnapshot();
+		head.base_snapshot = head.ref_snapshot;
+		return head;
+	}
+	if (refs) {
+		auto entry = refs->additional_properties.find(head.branch);
+		if (entry != refs->additional_properties.end()) {
+			auto &ref = entry->second;
+			//! Ref types are compared lower-cased everywhere, as in GetSnapshotByRef
+			if (StringUtil::Lower(ref.type) != "branch") {
+				throw InvalidInputException("Iceberg ref '%s' is a %s, not a branch: only branches can be written to "
+				                            "or used as '%s'",
+				                            head.branch, TruncateForError(ref.type), WAP_BRANCH_CONFIG_VARIABLE);
+			}
+			auto snapshot = FindSnapshotByIdInternal(ref.snapshot_id);
+			if (!snapshot) {
+				throw InvalidConfigurationException(
+				    "Iceberg branch '%s' points at snapshot %s, which is not in the table metadata", head.branch,
+				    std::to_string(ref.snapshot_id));
+			}
+			head.ref_snapshot = snapshot;
+			head.base_snapshot = snapshot;
+			return head;
+		}
+	}
+	//! The commit creates the branch, starting from main
+	head.base_snapshot = GetLatestSnapshot();
+	return head;
+}
+
+bool IcebergTableMetadata::HasBranchOtherThanMain() const {
+	//! Snapshots no ref points at (e.g. kept after a CREATE OR REPLACE) do not count: a parent-less commit is stamped
+	//! with last-sequence-number + 1, above all of them. Tags do not count either: Iceberg engines do not commit to
+	//! tags. Only another branch can receive concurrent commits that a parent-less snapshot staged on stale metadata
+	//! would then undercut. An unknown ref type counts as a branch, to fail closed.
+	if (!refs) {
+		return false;
+	}
+	for (auto &entry : refs->additional_properties) {
+		if (entry.first != "main" && StringUtil::Lower(entry.second.type) != "tag") {
+			return true;
+		}
+	}
+	return false;
+}
+
+IcebergSnapshotScanInfo IcebergTableMetadata::GetBranchReadSnapshot(const string &branch,
+                                                                    bool branch_pending_creation) const {
+	auto head = GetBranchHead(branch);
+	if (!head.IsMain() && !head.ref_snapshot && !branch_pending_creation) {
+		//! Never read main in place of a missing branch: an audit of the branch would silently see main's data
+		throw InvalidInputException(
+		    "Iceberg branch '%s' (set by '%s') does not exist in this table, and reads do not fall back to main. "
+		    "Create it first (an INSERT under '%s' creates it from main), read main with AT (VERSION => 'main'), "
+		    "or RESET %s",
+		    head.branch, WAP_BRANCH_CONFIG_VARIABLE, WAP_BRANCH_CONFIG_VARIABLE, WAP_BRANCH_CONFIG_VARIABLE);
+	}
+	IcebergSnapshotScanInfo snapshot_info;
+	snapshot_info.snapshot = head.base_snapshot;
+	snapshot_info.schema_id = GetCurrentSchemaId();
+	snapshot_info.is_transaction_head = true;
+	snapshot_info.head_branch = head.branch;
+	return snapshot_info;
+}
+
 IcebergSnapshotScanInfo IcebergTableMetadata::GetSnapshot(const IcebergSnapshotLookup &lookup) const {
 	IcebergSnapshotScanInfo snapshot_info;
 	switch (lookup.GetSource()) {
@@ -269,6 +342,7 @@ IcebergSnapshotScanInfo IcebergTableMetadata::GetSnapshot(const IcebergSnapshotL
 		snapshot_info.snapshot = GetLatestSnapshot();
 		snapshot_info.schema_id = GetCurrentSchemaId();
 		snapshot_info.is_transaction_head = true;
+		snapshot_info.head_branch = ICEBERG_MAIN_BRANCH;
 		return snapshot_info;
 	case SnapshotSource::FROM_ID:
 		snapshot_info.snapshot = GetSnapshotById(lookup.GetSnapshotId());
@@ -282,6 +356,7 @@ IcebergSnapshotScanInfo IcebergTableMetadata::GetSnapshot(const IcebergSnapshotL
 			snapshot_info.snapshot = nullptr;
 			snapshot_info.schema_id = GetCurrentSchemaId();
 			snapshot_info.is_transaction_head = true;
+			snapshot_info.head_branch = ICEBERG_MAIN_BRANCH;
 			return snapshot_info;
 		}
 		bool is_branch;
@@ -290,11 +365,19 @@ IcebergSnapshotScanInfo IcebergTableMetadata::GetSnapshot(const IcebergSnapshotL
 		//! (apache-iceberg-1.10.0, docs/docs/branching.md:118-122; a read-side, client rule): a branch
 		//! reads with the table's current schema, a tag with the schema of its snapshot
 		snapshot_info.schema_id = is_branch ? GetCurrentSchemaId() : snapshot_info.snapshot->GetSchemaId();
-		//! Reading 'main' explicitly must match a plain read, including this transaction's own writes.
-		//! Only when 'main' really is the transaction's base: out-of-spec metadata can have refs.main differ
-		//! from current-snapshot-id, and mixing the two would give an inconsistent read.
-		snapshot_info.is_transaction_head = is_branch && ref.name == "main" && current_snapshot_id &&
-		                                    snapshot_info.snapshot->snapshot_id == *current_snapshot_id;
+		//! Reading a branch explicitly must match a plain read of it, including this transaction's own writes
+		//! when they target that branch (IcebergTransactionData::IsVisibleIn). For 'main', only when it really
+		//! is the transaction's base: out-of-spec metadata can have refs.main differ from current-snapshot-id,
+		//! and mixing the two would give an inconsistent read. Other branches are based on their ref.
+		if (ref.name == ICEBERG_MAIN_BRANCH) {
+			snapshot_info.is_transaction_head =
+			    is_branch && current_snapshot_id && snapshot_info.snapshot->snapshot_id == *current_snapshot_id;
+		} else {
+			snapshot_info.is_transaction_head = is_branch;
+		}
+		if (snapshot_info.is_transaction_head) {
+			snapshot_info.head_branch = ref.name;
+		}
 		return snapshot_info;
 	}
 	case SnapshotSource::FROM_TIMESTAMP:

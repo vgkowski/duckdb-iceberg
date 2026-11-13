@@ -11,9 +11,16 @@ namespace duckdb {
 struct IcebergTable;
 struct IcebergTransactionData;
 struct IcebergTableMetadata;
+struct IcebergBranchHead;
 class IcebergSnapshotWriter;
 struct IcebergWrittenSnapshot;
 struct VersionedIcebergManifestDeletes;
+
+//! Throws a client-side refusal to stage a commit attempt. The refusal is definitive: nothing of this attempt was
+//! sent, and an earlier attempt is only retried after a definitive rejection (a 409, or the stale-sequence 400). It
+//! carries status_code 400, so the failed commit deletes its written data files and drops tables the transaction
+//! created, as for a catalog's 4xx (CommitStateUnknown in iceberg_transaction.cpp).
+[[noreturn]] void ThrowCommitRefusal(ExceptionType type, const string &message);
 
 enum class IcebergTableUpdateType : uint8_t {
 	ASSIGN_UUID,
@@ -58,9 +65,14 @@ public:
 	//! Adopt the written snapshot and its manifests together with the REST update that publishes it.
 	void AddWrittenSnapshot(IcebergWrittenSnapshot written);
 
+	//! The head the commit builds on, for the branch it targets
+	IcebergBranchHead GetBranchHead() const;
+
 public:
 	const IcebergTable &table_info;
 	ClientContext &context;
+	//! Branch the commit targets ("main" unless the transaction writes to a WAP branch)
+	const string branch;
 	vector<string> created_metadata_files;
 
 	rest_api_objects::CommitTableRequest table_change;
