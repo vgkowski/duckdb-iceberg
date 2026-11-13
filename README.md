@@ -196,21 +196,39 @@ RESET iceberg_wap_branch;
   - Servers built on Iceberg's Java library before 1.11 answer HTTP 400
     `ValidationException` "Cannot add snapshot with sequence number N older than last
     sequence number M", which Iceberg clients do not retry
-    ([apache/iceberg#15001](https://github.com/apache/iceberg/issues/15001)). This
-    extension reports that error as is; re-run the transaction. Examples are
-    `apache/iceberg-rest-fixture:1.10.1`, this repository's fixture catalog, against
+    ([apache/iceberg#15001](https://github.com/apache/iceberg/issues/15001)). Examples
+    are `apache/iceberg-rest-fixture:1.10.1`, this repository's fixture catalog, against
     which the WAP writes and this race were run
     (`test/sql/local/catalog_test_config_setup/catalog_specifc/fixture/wap_branch_race.test`),
     and Polaris 1.4, which pins Iceberg 1.10.1 (`gradle/libs.versions.toml` on
-    `release/1.4.x`) and was only tested for branch reads.
+    `release/1.4.x`) and was only tested for branch reads. This extension retries that
+    400 for commits that may retry (appends, and DELETEs allowed to retry; never a
+    transaction containing a MERGE or an UPDATE), re-staging on refreshed metadata, but
+    only when N is a number this commit stamped on one of its new snapshots, N is at most
+    M, and the refreshed metadata shows the table's last sequence number at least M;
+    otherwise the catalog's error is reported. The server builds the new metadata, where
+    it raises this error, before committing anything
+    ([CatalogHandlers.java#L410-L453 at 1.10.1](https://github.com/apache/iceberg/blob/apache-iceberg-1.10.1/core/src/main/java/org/apache/iceberg/rest/CatalogHandlers.java#L410-L453)),
+    so nothing landed. Multi-table commits go through `RESTCatalogAdapter.commitTransaction`,
+    which also validates every table in memory before committing any
+    ([RESTCatalogAdapter.java#L550-L573 at 1.10.1](https://github.com/apache/iceberg/blob/apache-iceberg-1.10.1/core/src/test/java/org/apache/iceberg/rest/RESTCatalogAdapter.java#L550-L573)).
+    This was checked only for these reference handlers; Polaris has its own commit
+    handlers, which were not checked.
   - Servers built on Iceberg's Java library 1.11 or later answer HTTP 409 instead
     ([apache/iceberg#15126](https://github.com/apache/iceberg/pull/15126)), which the
     usual conflict retry handles for appends; commits that are never retried (UPDATE,
-    MERGE) report the 409 as is.
-  - Other servers (for example Lakekeeper or Nessie) were not tested with WAP writes.
+    MERGE) report the 409 as is, so the error such a commit shows depends on the
+    server's version.
+  - Other servers (for example Lakekeeper or Nessie) were not tested with WAP writes; a
+    rejection worded or typed differently is reported as an error and not retried.
 
-  A retried DELETE is re-applied only if its branch still descends from the snapshot it
-  read through appends alone, so a branch reset or recreated meanwhile aborts.
+  On servers before 1.11, commits that may not retry, and retries that ran out (of
+  attempts or of the retry time budget), fail with "conflicts with a concurrent commit to
+  another branch", naming the tables whose staged sequence numbers include the rejected
+  one and quoting the catalog's message, when the message names a sequence number this
+  commit stamped; re-run them. Any other 400 is reported as the catalog sent it. A retried DELETE is
+  re-applied only if its branch still descends from the snapshot it read through appends
+  alone, so a branch reset or recreated meanwhile aborts.
 - Metadata functions (`iceberg_metadata`, `iceberg_files`, `iceberg_manifests`,
   `iceberg_partitions`, `iceberg_column_stats`, `iceberg_partition_stats`),
   `iceberg_scan` and `iceberg_scan_plan` of a catalog table read the branch too, unless

@@ -14,7 +14,9 @@
 #include "duckdb/main/query_result.hpp"
 #include "duckdb/common/json_document.hpp"
 
+#include <algorithm>
 #include <chrono>
+#include <cstring>
 #include <optional>
 #include <random>
 #include <thread>
@@ -116,11 +118,21 @@ static bool NeedsAssertSchemaId(const IcebergTransactionData &transaction_data, 
 
 namespace {
 
+//! The sequence numbers an attempt stamped on a table's new snapshots: [first, last], empty if last < first
+struct StagedSequenceRange {
+	int64_t first = 0;
+	int64_t last = -1;
+};
+
+//! Per table key
+using StagedSequences = unordered_map<string, StagedSequenceRange>;
+
 struct SingleTableStagedCommit {
 	rest_api_objects::CommitTableRequest request;
 	vector<string> created_metadata_files;
 	bool retryable = false;
 	IcebergRetryConfig retry_config;
+	StagedSequenceRange staged_sequences;
 };
 
 struct MultiTableStagedCommit {
@@ -129,6 +141,7 @@ struct MultiTableStagedCommit {
 	unordered_set<string> table_keys;
 	bool retryable = false;
 	IcebergRetryConfig retry_config;
+	StagedSequences staged_sequences;
 };
 
 //! Per-retry-loop backoff state: decorrelated jitter (de-synchronizes a thundering herd of
@@ -343,6 +356,9 @@ static SingleTableStagedCommit StageSingleTableCommit(DatabaseInstance &db, Iceb
 		set_snapshot_ref.CreateUpdate(db, context, commit_state);
 	}
 
+	//! Left empty (last < first) when the attempt adds no snapshot
+	commit_state.GetStagedSequenceRange(info.staged_sequences.first, info.staged_sequences.last);
+
 	info.created_metadata_files = std::move(commit_state.created_metadata_files);
 	info.request = std::move(table_change);
 	return info;
@@ -366,6 +382,7 @@ static MultiTableStagedCommit StageMultiTableCommit(DatabaseInstance &db, Iceber
 		                                   table_transaction_info.created_metadata_files.begin(),
 		                                   table_transaction_info.created_metadata_files.end());
 		info.table_keys.insert(updated_table.first);
+		info.staged_sequences[updated_table.first] = table_transaction_info.staged_sequences;
 		transaction.table_changes.push_back(std::move(table_transaction_info.request));
 		//! Tables in one atomic transaction share a single retry loop, so fold their retry policies
 		//! into the most lenient one (first table seeds it, the rest are merged in).
@@ -513,6 +530,152 @@ static bool CommitIsRetryable(bool retryable, idx_t max_retries, const CommitRes
 	return true;
 }
 
+static constexpr const char *STALE_SEQUENCE_PREFIX = "Cannot add snapshot with sequence number ";
+static constexpr const char *STALE_SEQUENCE_INFIX = " older than last sequence number ";
+
+//! A commit whose assert-ref-snapshot-id held, while a concurrent commit to another branch of the same table (WAP,
+//! or main while this commit targets a branch) advanced last-sequence-number past the one this attempt was staged
+//! on. Iceberg's TableMetadata builder then rejects the add-snapshot (server-side, apache-iceberg-1.10.1,
+//! core/src/main/java/org/apache/iceberg/TableMetadata.java:1250-1259). Servers built on Iceberg's Java library before
+//! 1.11 (e.g. iceberg-rest-fixture 1.10.1; Polaris release/1.4.x pins Iceberg 1.10.1 in gradle/libs.versions.toml)
+//! answer a non-retryable 400 ValidationException "Cannot add snapshot with sequence number N older than last
+//! sequence number M" (apache/iceberg#15001); 1.11 and later answer 409 (apache/iceberg#15126, server-side), which
+//! the usual conflict retry handles for retryable commits (others report it as is). Other servers' 400s are reported
+//! as is.
+static bool IsStaleSequenceRejection(const CommitResult &result) {
+	if (result.status != HTTPStatusCode::BadRequest_400 || !result.error_) {
+		return false;
+	}
+	auto &error = result.error_->_error;
+	return error.type == "ValidationException" && StringUtil::StartsWith(error.message, STALE_SEQUENCE_PREFIX);
+}
+
+//! Parses a non-negative ASCII decimal at 'pos', advancing it; false on no digits, a leading zero followed by more
+//! digits, or overflow. Java formats these longs with %s (Long.toString), which never pads with zeros, so a parsed
+//! message is at most 113 bytes long.
+static bool ParseSequenceNumber(const string &text, idx_t &pos, int64_t &result) {
+	idx_t start = pos;
+	result = 0;
+	while (pos < text.size() && text[pos] >= '0' && text[pos] <= '9') {
+		auto digit = static_cast<int64_t>(text[pos] - '0');
+		if (result > (NumericLimits<int64_t>::Maximum() - digit) / 10) {
+			return false;
+		}
+		result = result * 10 + digit;
+		pos++;
+	}
+	if (pos == start) {
+		return false;
+	}
+	//! "0" is a number, "02" is not
+	return text[start] != '0' || pos - start == 1;
+}
+
+//! Extracts N (the rejected sequence number) and M (the catalog's last sequence number) from the rejection message
+static bool ParseStaleSequenceMessage(const CommitResult &result, int64_t &rejected, int64_t &catalog_last) {
+	auto &message = result.error_->_error.message;
+	idx_t pos = strlen(STALE_SEQUENCE_PREFIX);
+	if (!ParseSequenceNumber(message, pos, rejected)) {
+		return false;
+	}
+	auto infix_length = strlen(STALE_SEQUENCE_INFIX);
+	if (message.compare(pos, infix_length, STALE_SEQUENCE_INFIX) != 0) {
+		return false;
+	}
+	pos += infix_length;
+	if (!ParseSequenceNumber(message, pos, catalog_last)) {
+		return false;
+	}
+	//! Nothing but an optional trailing period may follow M
+	return pos == message.size() || (pos + 1 == message.size() && message[pos] == '.');
+}
+
+//! A stale-sequence rejection that names a sequence number N this attempt stamped, parsed once per failed attempt
+struct StaleSequenceRejection {
+	//! M, the catalog's last-sequence-number when it rejected the commit
+	int64_t catalog_last = 0;
+	//! The tables of the commit whose staged range holds N, i.e. the ones the catalog may have rejected. The message
+	//! does not name the table, so in a multi-table commit there can be more than one.
+	vector<string> table_keys;
+	//! The "conflicts with a concurrent commit to another branch" error, reported if the commit is not retried
+	string conflict_message;
+};
+
+//! Parses a stale-sequence rejection. True only for a 400 ValidationException whose message is exactly the Java text
+//! (see IsStaleSequenceRejection) with N <= M, where N lies in the staged range (first <= N <= last) of at least one
+//! table of the commit. False otherwise: the caller then reports the catalog's error as is, before any cleanup or
+//! refresh.
+static bool TryParseStaleSequenceRejection(const CommitResult &result, IcebergTransactionAlterUpdate &alter_update,
+                                           const StagedSequences &staged, StaleSequenceRejection &rejection) {
+	if (!IsStaleSequenceRejection(result)) {
+		return false;
+	}
+	int64_t rejected;
+	if (!ParseStaleSequenceMessage(result, rejected, rejection.catalog_last) || rejected > rejection.catalog_last) {
+		return false;
+	}
+	vector<string> names;
+	for (auto &entry : staged) {
+		if (entry.second.first > rejected || rejected > entry.second.last) {
+			continue;
+		}
+		auto it = alter_update.updated_tables.find(entry.first);
+		if (it == alter_update.updated_tables.end()) {
+			continue;
+		}
+		rejection.table_keys.push_back(entry.first);
+		names.push_back(it->second.get().name);
+	}
+	if (names.empty()) {
+		return false;
+	}
+	std::sort(names.begin(), names.end());
+	//! The message comes from the server: quote a bounded prefix of it. A parsed message is ASCII and at most 113
+	//! bytes, so the cap is defence in depth and can not split a UTF-8 sequence.
+	static constexpr idx_t MAX_QUOTED_MESSAGE_LENGTH = 256;
+	auto &message = result.error_->_error.message;
+	auto quoted =
+	    message.size() > MAX_QUOTED_MESSAGE_LENGTH ? message.substr(0, MAX_QUOTED_MESSAGE_LENGTH) + "..." : message;
+	rejection.conflict_message =
+	    StringUtil::Format("The commit conflicts with a concurrent commit to another branch of \"%s\"; "
+	                       "re-run the transaction (catalog: %s)",
+	                       StringUtil::Join(names, "\", \""), quoted);
+	return true;
+}
+
+//! Whether the parsed stale-sequence rejection is explained by a concurrent commit, so re-staging on the refreshed
+//! metadata is justified. TryParseStaleSequenceRejection already checked the message against what this attempt
+//! staged (staged first <= N <= staged last, and N <= M); this checks that the refresh confirms the catalog state the
+//! message describes: for one of the rejected tables, the refreshed last-sequence-number is >= M. Since staged first
+//! is the staged-on last-sequence-number + 1, this also proves another commit advanced it. Otherwise (a catalog that
+//! disagrees with its own refresh) the error is surfaced.
+//! Re-staging can not duplicate data: Java servers build the new metadata, which is where this rejection is raised,
+//! before committing anything (server-side, apache-iceberg-1.10.1, single-table:
+//! core/src/main/java/org/apache/iceberg/rest/CatalogHandlers.java:410-453; multi-table:
+//! core/src/test/java/org/apache/iceberg/rest/RESTCatalogAdapter.java:550-573, which validates every table in memory
+//! before committing any). Only these reference handlers were checked; servers with their own handlers (e.g. Polaris)
+//! were not.
+static bool StaleSequenceRetryJustified(const StaleSequenceRejection &rejection,
+                                        IcebergTransactionAlterUpdate &alter_update) {
+	for (auto &key : rejection.table_keys) {
+		auto it = alter_update.updated_tables.find(key);
+		if (it == alter_update.updated_tables.end()) {
+			continue;
+		}
+		auto refreshed = static_cast<int64_t>(it->second.get().GetMetadata().last_sequence_number);
+		if (refreshed >= rejection.catalog_last) {
+			return true;
+		}
+	}
+	return false;
+}
+
+[[noreturn]] static void ThrowStaleSequenceConflict(const string &conflict_message) {
+	//! The catalog rejected the commit with a 400, so nothing landed: keep the status for orphan cleanup
+	unordered_map<string, string> extra_info {{"status_code", "400"}};
+	throw Exception(extra_info, ExceptionType::TRANSACTION, conflict_message);
+}
+
 // 4xx = definitive rejection (commit did not land) -> delete the orphan. 5xx / no HTTP status
 // (connection error/timeout) = outcome unknown (may have landed) -> keep files. Status is in
 // extra_info (HTTPException) or the message "status code (<status>)" (fallback).
@@ -656,15 +819,31 @@ void IcebergTransaction::DoMultiTableCommitUpdates(IcebergTransactionAlterUpdate
 		if (result.Success()) {
 			return;
 		}
+		bool stale_sequence = false;
+		StaleSequenceRejection rejection;
 		if (!CommitIsRetryable(transaction_info.retryable, transaction_info.retry_config.num_retries, result,
 		                       attempt)) {
-			result.Throw(catalog.GetBaseUrl().GetURLEncoded());
+			//! Checked before cleanup and refresh, so any other error is reported as the catalog sent it
+			if (!TryParseStaleSequenceRejection(result, alter_update, transaction_info.staged_sequences, rejection)) {
+				result.Throw(catalog.GetBaseUrl().GetURLEncoded());
+			}
+			if (!transaction_info.retryable || attempt >= transaction_info.retry_config.num_retries) {
+				CleanupMetadataFiles(context, transaction_info.created_metadata_files);
+				ThrowStaleSequenceConflict(rejection.conflict_message);
+			}
+			stale_sequence = true;
 		}
 		CleanupMetadataFiles(context, transaction_info.created_metadata_files);
 		RefreshRetryTables(alter_update, transaction_info.table_keys, context);
+		if (stale_sequence && !StaleSequenceRetryJustified(rejection, alter_update)) {
+			result.Throw(catalog.GetBaseUrl().GetURLEncoded());
+		}
 		//! Back off before the next attempt to de-synchronize concurrent writers; stop if the
 		//! cumulative retry budget (commit.retry.total-timeout-ms) would be exceeded.
 		if (!backoff->WaitBeforeRetry(attempt)) {
+			if (stale_sequence) {
+				ThrowStaleSequenceConflict(rejection.conflict_message);
+			}
 			result.Throw(catalog.GetBaseUrl().GetURLEncoded());
 		}
 	}
@@ -696,16 +875,33 @@ void IcebergTransaction::DoSingleTableCommitUpdates(IcebergTransactionAlterUpdat
 			return;
 		}
 
-		if (!CommitIsRetryable(table_transaction_info.retryable, table_transaction_info.retry_config.num_retries,
-		                       result, attempt)) {
-			result.Throw(catalog.GetBaseUrl().GetURLEncoded());
-		}
-		CleanupMetadataFiles(context, table_transaction_info.created_metadata_files);
 		unordered_set<string> retry_tables;
 		retry_tables.insert(table_key);
+		bool stale_sequence = false;
+		StaleSequenceRejection rejection;
+		if (!CommitIsRetryable(table_transaction_info.retryable, table_transaction_info.retry_config.num_retries,
+		                       result, attempt)) {
+			//! Checked before cleanup and refresh, so any other error is reported as the catalog sent it
+			StagedSequences staged {{table_key, table_transaction_info.staged_sequences}};
+			if (!TryParseStaleSequenceRejection(result, alter_update, staged, rejection)) {
+				result.Throw(catalog.GetBaseUrl().GetURLEncoded());
+			}
+			if (!table_transaction_info.retryable || attempt >= table_transaction_info.retry_config.num_retries) {
+				CleanupMetadataFiles(context, table_transaction_info.created_metadata_files);
+				ThrowStaleSequenceConflict(rejection.conflict_message);
+			}
+			stale_sequence = true;
+		}
+		CleanupMetadataFiles(context, table_transaction_info.created_metadata_files);
 		RefreshRetryTables(alter_update, retry_tables, context);
+		if (stale_sequence && !StaleSequenceRetryJustified(rejection, alter_update)) {
+			result.Throw(catalog.GetBaseUrl().GetURLEncoded());
+		}
 		//! Back off before the next attempt; stop if the retry budget would be exceeded.
 		if (!backoff->WaitBeforeRetry(attempt)) {
+			if (stale_sequence) {
+				ThrowStaleSequenceConflict(rejection.conflict_message);
+			}
 			result.Throw(catalog.GetBaseUrl().GetURLEncoded());
 		}
 	}

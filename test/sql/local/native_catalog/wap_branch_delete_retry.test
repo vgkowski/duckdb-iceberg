@@ -70,8 +70,8 @@ SELECT id FROM my_datalake.default.wap_del ORDER BY id;
 5
 6
 
-# A concurrent commit to main is not on its branch, but it advances the table-wide last-sequence-number: the catalog
-# rejects the branch commit with a 400 (as servers on Iceberg's Java library before 1.11, apache/iceberg#15001)
+# ... and over concurrent commits to main, which are not on its branch: the catalog's 400 for the stale sequence
+# number (apache/iceberg#15001) is retried on the refreshed metadata
 statement ok con1
 BEGIN;
 
@@ -81,15 +81,12 @@ DELETE FROM my_datalake.default.wap_del WHERE id = 2;
 statement ok
 DELETE FROM my_datalake.default.wap_del WHERE id = 3;
 
-statement error con1
+statement ok con1
 COMMIT;
-----
-Cannot add snapshot with sequence number
 
 query I con1
 SELECT id FROM my_datalake.default.wap_del ORDER BY id;
 ----
-2
 3
 4
 5

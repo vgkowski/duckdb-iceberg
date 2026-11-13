@@ -6,6 +6,8 @@ require-env CATALOG_TEST_CONFIG_SETUP mock
 
 include test/sql/init_requires
 
+require json
+
 statement ok
 CREATE TABLE my_datalake.default.wap_conflicts (id INTEGER);
 
@@ -77,9 +79,7 @@ COMMIT;
 ----
 conflicts with a concurrent commit
 
-# A commit to main between the branch statement and its commit advances the table-wide last-sequence-number. The
-# branch's assert-ref-snapshot-id holds, so the catalog rejects the stale sequence number with a 400 (as Iceberg's
-# TableMetadata.Builder.addSnapshot, server-side, before Iceberg 1.11: apache/iceberg#15001), reported as is
+# Commits to main do not conflict with a commit to the branch, and the branch commit does not move main
 statement ok con1
 BEGIN;
 
@@ -89,23 +89,17 @@ DELETE FROM my_datalake.default.wap_conflicts WHERE id = 1;
 statement ok
 INSERT INTO my_datalake.default.wap_conflicts VALUES (100);
 
-statement error con1
-COMMIT;
-----
-Cannot add snapshot with sequence number 7 older than last sequence number 7
-
 statement ok con1
-UPDATE my_datalake.default.wap_conflicts SET id = id + 10 WHERE id = 2;
+COMMIT;
 
 query I con1
 SELECT id FROM my_datalake.default.wap_conflicts ORDER BY id;
 ----
-1
+2
 3
 4
 5
 6
-12
 
 query I
 SELECT id FROM my_datalake.default.wap_conflicts ORDER BY id;
@@ -113,15 +107,80 @@ SELECT id FROM my_datalake.default.wap_conflicts ORDER BY id;
 1
 100
 
-# Neither branch commit moved main
 query I
 SELECT parent_id = getvariable('main_snapshot') FROM iceberg_snapshots(my_datalake.default.wap_conflicts)
 WHERE snapshot_id = (SELECT snapshot_id FROM iceberg_refs(my_datalake.default.wap_conflicts) WHERE name = 'main');
 ----
 true
 
+# An UPDATE is not retried, so a concurrent commit to main fails it with a conflict rather than the catalog's 400
+statement ok con1
+BEGIN;
+
+statement ok con1
+UPDATE my_datalake.default.wap_conflicts SET id = id + 10 WHERE id = 2;
+
+statement ok
+INSERT INTO my_datalake.default.wap_conflicts VALUES (101);
+
+statement error con1
+COMMIT;
+----
+conflicts with a concurrent commit to another branch of "wap_conflicts"; re-run
+
+query I con1
+SELECT id FROM my_datalake.default.wap_conflicts ORDER BY id;
+----
+2
+3
+4
+5
+6
+
+query I
+SELECT id FROM my_datalake.default.wap_conflicts ORDER BY id;
+----
+1
+100
+101
+
 statement ok
 DROP TABLE my_datalake.default.wap_conflicts;
+
+# With retries disabled, an append to an existing branch racing a commit to main fails with the same conflict
+statement ok
+CREATE TABLE my_datalake.default.wap_no_retry (id INTEGER) WITH ('commit.retry.num-retries' = '0');
+
+statement ok
+INSERT INTO my_datalake.default.wap_no_retry VALUES (1);
+
+# Creates the branch (sequence number 2), so the race below is not on main's assertion
+statement ok con1
+INSERT INTO my_datalake.default.wap_no_retry VALUES (2);
+
+statement ok con1
+BEGIN;
+
+statement ok con1
+INSERT INTO my_datalake.default.wap_no_retry VALUES (3);
+
+statement ok
+INSERT INTO my_datalake.default.wap_no_retry VALUES (4);
+
+statement error con1
+COMMIT;
+----
+conflicts with a concurrent commit to another branch of "wap_no_retry"; re-run the transaction (catalog: Cannot add snapshot with sequence number 3 older than last sequence number 3)
+
+query I con1
+SELECT id FROM my_datalake.default.wap_no_retry ORDER BY id;
+----
+1
+2
+
+statement ok
+DROP TABLE my_datalake.default.wap_no_retry;
+
 
 # A branch is never created while main has no snapshot: its first snapshot would have no parent, which Java catalogs
 # exempt from the sequence-number check, so a stale staged number would not be above last-sequence-number
@@ -144,7 +203,7 @@ Insert into main first
 statement ok con1
 ROLLBACK;
 
-# Commits to main, then a DELETE on main: the deleted row stays deleted and sequence numbers only grow
+# Concurrent commits to main, then a DELETE on main: the deleted row stays deleted and sequence numbers only grow
 statement ok
 INSERT INTO my_datalake.default.wap_parentless VALUES (1);
 
@@ -171,9 +230,9 @@ SELECT count(*) FROM iceberg_refs(my_datalake.default.wap_parentless) WHERE name
 statement ok
 DROP TABLE my_datalake.default.wap_parentless;
 
-# A commit that creates a branch asserts main at the snapshot the branch starts from. Main moved twice, so the first
-# attempt fails that assertion with a 409, and the append is retried onto main's new head: it never lowers or repeats
-# the table's last-sequence-number, and a later DELETE on main covers every row it should
+# Regression: a branch-creating commit raced by two main commits fails its assertion of main with a 409 and is
+# re-staged above them onto main's new head, so a later DELETE on main covers every row it should, and no commit
+# lowered the table's last sequence number
 statement ok
 CREATE TABLE my_datalake.default.wap_seq (id INTEGER);
 
@@ -225,10 +284,17 @@ SELECT id FROM my_datalake.default.wap_seq ORDER BY id;
 1
 2
 
+# Five snapshots (three main appends, the branch append, the delete) with distinct sequence numbers 1..5, the delete
+# last
 query III
 SELECT count(*), count(DISTINCT sequence_number), max(sequence_number) FROM iceberg_snapshots(my_datalake.default.wap_seq);
 ----
 5	5	5
+
+query I
+SELECT operation FROM iceberg_snapshots(my_datalake.default.wap_seq) ORDER BY sequence_number DESC LIMIT 1;
+----
+delete
 
 statement ok
 DROP TABLE my_datalake.default.wap_seq;
@@ -273,3 +339,181 @@ SELECT id FROM my_datalake.default.wap_create_no_retry ORDER BY id;
 
 statement ok
 DROP TABLE my_datalake.default.wap_create_no_retry;
+
+# A multi-table commit names only the table the catalog rejected, with the catalog's message
+statement ok
+CREATE TABLE my_datalake.default.wap_multi_a (id INTEGER);
+
+statement ok
+CREATE TABLE my_datalake.default.wap_multi_b (id INTEGER);
+
+statement ok
+INSERT INTO my_datalake.default.wap_multi_a VALUES (1);
+
+statement ok
+INSERT INTO my_datalake.default.wap_multi_b VALUES (1);
+
+statement ok
+INSERT INTO my_datalake.default.wap_multi_b VALUES (2);
+
+statement ok
+INSERT INTO my_datalake.default.wap_multi_b VALUES (3);
+
+statement ok
+INSERT INTO my_datalake.default.wap_multi_b VALUES (4);
+
+statement ok con1
+INSERT INTO my_datalake.default.wap_multi_a VALUES (2);
+
+statement ok con1
+INSERT INTO my_datalake.default.wap_multi_b VALUES (5);
+
+statement ok con1
+BEGIN;
+
+statement ok con1
+UPDATE my_datalake.default.wap_multi_a SET id = id + 10 WHERE id = 1;
+
+statement ok con1
+INSERT INTO my_datalake.default.wap_multi_b VALUES (6);
+
+statement ok
+INSERT INTO my_datalake.default.wap_multi_a VALUES (100);
+
+statement error con1
+COMMIT;
+----
+conflicts with a concurrent commit to another branch of "wap_multi_a"; re-run the transaction (catalog: Cannot add snapshot with sequence number 3 older than last sequence number 3)
+
+query I con1
+SELECT count(*) FROM my_datalake.default.wap_multi_b;
+----
+5
+
+statement ok
+DROP TABLE my_datalake.default.wap_multi_a;
+
+statement ok
+DROP TABLE my_datalake.default.wap_multi_b;
+
+# A 400 that does not describe this commit's own stale sequence number is reported as the catalog's error, neither
+# retried nor reworded as a conflict. The catalog's answers are scripted.
+statement ok
+CREATE TABLE my_datalake.default.wap_other_400 (id INTEGER);
+
+statement ok
+INSERT INTO my_datalake.default.wap_other_400 VALUES (1);
+
+statement ok con1
+INSERT INTO my_datalake.default.wap_other_400 VALUES (2);
+
+statement ok
+SET VARIABLE script_400 = $$
+SELECT status FROM iceberg_test_catalog_request('POST', '/__test/response',
+	'{"method": "POST", "path": "PATH", "status": 400, "body": {"error": {"message": "MESSAGE", "type": "ValidationException", "code": 400}}}')
+$$;
+
+# A number this commit did not stamp (it stamps 3)
+query I
+SELECT * FROM query(getvariable('script_400').replace('PATH', '/v1/transactions/commit')
+	.replace('MESSAGE', 'Cannot add snapshot with sequence number 99 older than last sequence number 100'));
+----
+204
+
+query I
+SELECT * FROM query(getvariable('script_400').replace('PATH', '/v1/namespaces/default/tables/wap_other_400')
+	.replace('MESSAGE', 'Cannot add snapshot with sequence number 99 older than last sequence number 100'));
+----
+204
+
+# Not retryable (UPDATE)
+statement error con1
+UPDATE my_datalake.default.wap_other_400 SET id = 20 WHERE id = 2;
+----
+message: Cannot add snapshot with sequence number 99 older than last sequence number 100
+
+# Retryable (append): reported before any cleanup or refresh, so it is not retried
+statement error con1
+INSERT INTO my_datalake.default.wap_other_400 VALUES (3);
+----
+message: Cannot add snapshot with sequence number 99 older than last sequence number 100
+
+# A number this commit stamped, but a message that does not parse
+query I
+SELECT * FROM query(getvariable('script_400').replace('PATH', '/v1/transactions/commit')
+	.replace('MESSAGE', 'Cannot add snapshot with sequence number 3 older than last sequence number 3, see logs'));
+----
+204
+
+query I
+SELECT * FROM query(getvariable('script_400').replace('PATH', '/v1/namespaces/default/tables/wap_other_400')
+	.replace('MESSAGE', 'Cannot add snapshot with sequence number 3 older than last sequence number 3, see logs'));
+----
+204
+
+statement error con1
+UPDATE my_datalake.default.wap_other_400 SET id = 20 WHERE id = 2;
+----
+message: Cannot add snapshot with sequence number 3 older than last sequence number 3, see logs
+
+statement ok
+SET VARIABLE gets_before = (SELECT count(*) FROM read_json_auto('{TEMP_DIR}/iceberg-native/*/requests.jsonl')
+	WHERE method = 'GET' AND path = '/v1/namespaces/default/tables/wap_other_400');
+
+statement error con1
+INSERT INTO my_datalake.default.wap_other_400 VALUES (3);
+----
+message: Cannot add snapshot with sequence number 3 older than last sequence number 3, see logs
+
+# The unparsable message was reported without refreshing the table after the failed commit: the append loaded the
+# table once, at bind
+query I
+SELECT count(*) - getvariable('gets_before') FROM read_json_auto('{TEMP_DIR}/iceberg-native/*/requests.jsonl')
+WHERE method = 'GET' AND path = '/v1/namespaces/default/tables/wap_other_400';
+----
+1
+
+# A number this commit stamped, written with a leading zero: Java never pads these numbers (Long.toString), so the
+# message does not parse
+query I
+SELECT * FROM query(getvariable('script_400').replace('PATH', '/v1/transactions/commit')
+	.replace('MESSAGE', 'Cannot add snapshot with sequence number 03 older than last sequence number 3'));
+----
+204
+
+query I
+SELECT * FROM query(getvariable('script_400').replace('PATH', '/v1/namespaces/default/tables/wap_other_400')
+	.replace('MESSAGE', 'Cannot add snapshot with sequence number 03 older than last sequence number 3'));
+----
+204
+
+statement error con1
+UPDATE my_datalake.default.wap_other_400 SET id = 20 WHERE id = 2;
+----
+message: Cannot add snapshot with sequence number 03 older than last sequence number 3
+
+statement error con1
+INSERT INTO my_datalake.default.wap_other_400 VALUES (3);
+----
+message: Cannot add snapshot with sequence number 03 older than last sequence number 3
+
+query I
+SELECT status FROM iceberg_test_catalog_request('DELETE', '/__test/response', NULL);
+----
+204
+
+# Each statement sent one commit: none was retried
+query I
+SELECT count(*) FROM read_json_auto('{TEMP_DIR}/iceberg-native/*/requests.jsonl')
+WHERE method = 'POST' AND status = 400 AND request LIKE '%wap_other_400%';
+----
+6
+
+query I con1
+SELECT id FROM my_datalake.default.wap_other_400 ORDER BY id;
+----
+1
+2
+
+statement ok
+DROP TABLE my_datalake.default.wap_other_400;

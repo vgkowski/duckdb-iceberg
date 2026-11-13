@@ -78,16 +78,9 @@ INSERT INTO my_datalake.default.wap_v3 VALUES (10, 'branch');
 statement ok con2
 INSERT INTO my_datalake.default.wap_v3 VALUES (20, 'main');
 
-# The main write advanced the table-wide last-sequence-number, so the catalog rejects the branch commit with a 400
-# (as servers on Iceberg's Java library before 1.11, apache/iceberg#15001)
-statement error con1
-COMMIT;
-----
-Cannot add snapshot with sequence number
-
-# Re-run, it is staged on the refreshed next-row-id
+# The catalog's 400 for the stale sequence number is retried, re-staged on the refreshed next-row-id
 statement ok con1
-INSERT INTO my_datalake.default.wap_v3 VALUES (10, 'branch');
+COMMIT;
 
 statement ok con1
 RESET iceberg_wap_branch;

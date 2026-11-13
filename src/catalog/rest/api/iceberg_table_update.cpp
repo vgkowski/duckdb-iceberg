@@ -68,7 +68,8 @@ static string GetCommitBranch(const IcebergTable &table_info) {
 
 IcebergCommitState::IcebergCommitState(const IcebergTable &table_info, ClientContext &context)
     : format_metadata(CreateFormatMetadata(table_info)), table_info(table_info), context(context),
-      branch(GetCommitBranch(table_info)), last_sequence_number(GetTableMetadata().last_sequence_number),
+      branch(GetCommitBranch(table_info)), staged_on_sequence_number(GetTableMetadata().last_sequence_number),
+      last_sequence_number(staged_on_sequence_number),
       row_ids(GetTableMetadata().iceberg_version >= 3 ? GetTableMetadata().next_row_id.value_or(0) : 0) {
 }
 
@@ -87,6 +88,16 @@ optional_ptr<const IcebergSnapshot> IcebergCommitState::GetLatestSnapshot() cons
 
 IcebergBranchHead IcebergCommitState::GetBranchHead() const {
 	return GetTableMetadata().GetBranchHead(branch);
+}
+
+bool IcebergCommitState::GetStagedSequenceRange(sequence_number_t &first, sequence_number_t &last) const {
+	if (last_sequence_number == staged_on_sequence_number) {
+		return false;
+	}
+	//! A snapshot was written, so staged_on_sequence_number + 1 did not overflow (IcebergSnapshot::NextSequenceNumber)
+	first = staged_on_sequence_number + 1;
+	last = last_sequence_number;
+	return true;
 }
 
 int64_t IcebergCommitState::ReconstructTotalFilesSize(int32_t schema_id) {
